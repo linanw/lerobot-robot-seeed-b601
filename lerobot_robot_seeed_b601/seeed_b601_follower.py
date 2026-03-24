@@ -48,30 +48,33 @@ class SeeedB601FollowerConfigBase:
     # Motor hardware model specifications (to be defined by subclass)
     motor_models: dict[str, str] = field(default_factory=dict)
 
-    # MIT control parameters for position control (used in send_action)
-    position_kp: list[float] = field(
-        default_factory=lambda: [200.0, 300.0, 300.0, 80.0, 80.0, 80.0, 80.0]
-    )
-    position_kd: list[float] = field(
-        default_factory=lambda: [2.0, 3.0, 3.0, 0.5, 0.5, 0.5, 0.5]
-    )
+    # Control parameters are defined by concrete subclasses so different motor families
+    # can keep their own defaults.
+    # MIT gains used only by the gripper motor.
+    gripper_mit_kp: float = 0.0
+    gripper_mit_kd: float = 0.0
+    # Default target velocity for joints running in POS_VEL mode, in degrees/s.
+    pos_vel_velocity: float | list[float] = field(default_factory=list)
 
     # Values for joint limits (Degrees)
     # Note: These are soft limits. Physical verification is recommended.
     joint_limits: dict[str, tuple[float, float]] = field(
         default_factory=lambda: {
-            "joint_1": (-170.0, 170.0),
-            "joint_2": (-90.0, 90.0),
-            "joint_3": (-150.0, 150.0),
-            "joint_4": (-100.0, 100.0),
+            "joint_1": (-145.0, 145.0),
+            "joint_2": (-170.0, 1.0),
+            "joint_3": (-200.0, 1.0),
+            "joint_4": (-80.0, 90.0),
             "joint_5": (-90.0, 90.0),
-            "joint_6": (-170.0, 170.0),
+            "joint_6": (-90.0, 90.0),
             "gripper": (-270.0, 0.0),
         }
     )
 
 
 logger = logging.getLogger(__name__)
+
+
+FOLLOWER_GRIPPER_MOTOR = "gripper"
 
 
 class SeeedB601FollowerBase(Robot):
@@ -213,18 +216,22 @@ class SeeedB601FollowerBase(Robot):
 
     def configure(self) -> None:
         """Configure motors with appropriate settings."""
-        for motor in self.motors.values():
-            motor.enable()
+        self.bus.enable_all()
 
         # Damiao motors need a short delay after enable before register operations
         time.sleep(0.3)
 
         for motor_name, motor in self.motors.items():
+            target_mode = (
+                MotorBridgeMode.MIT
+                if motor_name == FOLLOWER_GRIPPER_MOTOR
+                else MotorBridgeMode.POS_VEL
+            )
             try:
-                motor.ensure_mode(MotorBridgeMode.MIT)
+                motor.ensure_mode(target_mode)
             except Exception:
                 logger.warning(
-                    f"ensure_mode(MIT) failed for {motor_name}, continuing anyway"
+                    f"ensure_mode({target_mode.name}) failed for {motor_name}, continuing anyway"
                 )
 
     def get_observation(self) -> RobotObservation:
@@ -260,20 +267,23 @@ class SeeedB601FollowerBase(Robot):
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} get_observation took: {dt_ms:.1f}ms")
+        print(f"{self} get_observation took: {dt_ms:.1f}ms")
+        print(f"Observation: {obs_dict}")
 
         return obs_dict
 
     def send_action(
         self,
         action: RobotAction,
-        custom_kp: dict[str, float] | None = None,
-        custom_kd: dict[str, float] | None = None,
+        custom_gripper_mit_kp: float | None = None,
+        custom_gripper_mit_kd: float | None = None,
     ) -> RobotAction:
         """Send action command to robot."""
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+        goal_vel = {key.removesuffix(".vel"): val for key, val in action.items() if key.endswith(".vel")}
 
         # Apply joint limit clipping
         for motor_name, position in goal_pos.items():
@@ -306,24 +316,43 @@ class SeeedB601FollowerBase(Robot):
             except ValueError:
                 idx = 0 # Fallback
 
-            # Determine Kp/Kd
-            if custom_kp and motor_name in custom_kp:
-                kp = custom_kp[motor_name]
-            else:
-                kp = self.config.position_kp[idx] if isinstance(self.config.position_kp, list) else self.config.position_kp
-            
-            if custom_kd and motor_name in custom_kd:
-                kd = custom_kd[motor_name]
-            else:
-                kd = self.config.position_kd[idx] if isinstance(self.config.position_kd, list) else self.config.position_kd
-
             # Convert target position from degrees to radians for motorbridge
             pos_rad = math.radians(position_degrees)
+            # if motor_name in goal_vel:
+            #     vel_deg_s = goal_vel[motor_name]
+            # else:
+            #     vel_deg_s = (
+            #         self.config.pos_vel_velocity[idx]
+            #         if isinstance(self.config.pos_vel_velocity, list)
+            #         else self.config.pos_vel_velocity
+            #     )
+            
 
             motor = self.motors.get(motor_name)
             if motor is not None:
-                # MIT Mode explicit control (pos, vel, kp, kd, tau)
-                motor.send_mit(pos_rad, 0.0, kp, kd, 0.0)
+                if motor_name == FOLLOWER_GRIPPER_MOTOR:
+                    # Keep the gripper in MIT mode for finer compliance control.
+                    kp = (
+                        custom_gripper_mit_kp
+                        if custom_gripper_mit_kp is not None
+                        else self.config.gripper_mit_kp
+                    )
+                    kd = (
+                        custom_gripper_mit_kd
+                        if custom_gripper_mit_kd is not None
+                        else self.config.gripper_mit_kd
+                    )
+                    motor.send_mit(pos_rad, 0.0, kp, kd, 0.0)
+                    print(f"Sent MIT command to {motor_name}: pos={position_degrees:.2f}°, kp={kp}, kd={kd}")
+                else:
+                    vel_deg_s = (
+                        self.config.pos_vel_velocity[idx]
+                        if isinstance(self.config.pos_vel_velocity, list)
+                        else self.config.pos_vel_velocity
+                    )
+                    vel_rad = math.radians(vel_deg_s)
+                    motor.send_pos_vel(pos_rad, vel_rad)
+                    print(f"Sent POS_VEL command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
 
         # motorbridge sends packets mostly synchronously here over loop, 
         # so we don't need a bulk send command through ctypes.

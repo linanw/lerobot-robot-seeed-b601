@@ -7,6 +7,9 @@ from .seeed_b601_follower import SeeedB601FollowerConfigBase
 @RobotConfig.register_subclass("seeed_b601_rs_follower")
 @dataclass
 class SeeedB601RSFollowerConfig(RobotConfig, SeeedB601FollowerConfigBase):
+    gripper_mit_kp: float = 80.0
+    gripper_mit_kd: float = 0.5
+    pos_vel_velocity: float | list[float] = 180.0
     motor_models: dict[str, str] = field(
         default_factory=lambda: {
             "joint_1": "04",
