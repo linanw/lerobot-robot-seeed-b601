@@ -19,34 +19,38 @@ from lerobot.robots.utils import ensure_safe_goal_position
 @dataclass
 class SeeedB601FollowerConfigBase:
     """Base configuration for the Seeed B601 Follower arm."""
+
+    # Communication port for CAN adapter (e.g., "can0" for SocketCAN, or "/dev/ttyACM0" for Damiao serial bridge)
     port: str
+    
     # CAN adapter type:
     #   "socketcan"  - SocketCAN based adapters (PCAN, slcan, embedded can controller, etc.)
     #   "damiao"     - Damiao dedicated serial bridge
     #   "robstride"  - RobStride dedicated adapter (placeholder, not yet supported)
     can_adapter: str = "socketcan"
+
     # Baud rate for Damiao serial bridge (only used when can_adapter="damiao")
     dm_serial_baud: int = 921600
+
     disable_torque_on_disconnect: bool = True
+
     max_relative_target: float | dict[str, float] | None = None
+
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     
     # Motor configuration for B601 (6 DOF + Gripper)
     # Maps motor names to (send_can_id, recv_can_id)
     motor_can_ids: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
-            "joint_1": (0x01, 0x11),
-            "joint_2": (0x02, 0x12),
-            "joint_3": (0x03, 0x13),
-            "joint_4": (0x04, 0x14),
-            "joint_5": (0x05, 0x15),
-            "joint_6": (0x06, 0x16),
-            "gripper": (0x07, 0x17),
+            "shoulder_pan":  (0x01, 0x11),
+            "shoulder_lift": (0x02, 0x12),
+            "elbow_flex":    (0x03, 0x13),
+            "wrist_flex":    (0x04, 0x14),
+            "wrist_roll":    (0x05, 0x15),
+            "wrist_yaw":     (0x06, 0x16),
+            "gripper":       (0x07, 0x17),
         }
     )
-    
-    # Motor hardware model specifications (to be defined by subclass)
-    motor_models: dict[str, str] = field(default_factory=dict)
 
     # Control parameters are defined by concrete subclasses so different motor families
     # can keep their own defaults.
@@ -60,13 +64,13 @@ class SeeedB601FollowerConfigBase:
     # Note: These are soft limits. Physical verification is recommended.
     joint_limits: dict[str, tuple[float, float]] = field(
         default_factory=lambda: {
-            "joint_1": (-145.0, 145.0),
-            "joint_2": (-170.0, 1.0),
-            "joint_3": (-200.0, 1.0),
-            "joint_4": (-80.0, 90.0),
-            "joint_5": (-90.0, 90.0),
-            "joint_6": (-90.0, 90.0),
-            "gripper": (-270.0, 0.0),
+            "shoulder_pan":  (-145.0, 145.0),
+            "shoulder_lift": (-170.0, 1.0),
+            "elbow_flex":    (-200.0, 1.0),
+            "wrist_flex":    (-80.0, 90.0),
+            "wrist_roll":    (-90.0, 90.0),
+            "wrist_yaw":     (-90.0, 90.0),
+            "gripper":       (-270.0, 0.0),
         }
     )
 
@@ -92,8 +96,6 @@ class SeeedB601FollowerBase(Robot):
 
         # Initialize cameras
         self.cameras = make_cameras_from_configs(config.cameras)
-
-        logger.setLevel(logging.DEBUG)
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -267,8 +269,7 @@ class SeeedB601FollowerBase(Robot):
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} get_observation took: {dt_ms:.1f}ms")
-        print(f"{self} get_observation took: {dt_ms:.1f}ms")
-        print(f"Observation: {obs_dict}")
+        # logger.debug(f"Observation: {obs_dict}")
 
         return obs_dict
 
@@ -283,7 +284,6 @@ class SeeedB601FollowerBase(Robot):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
-        goal_vel = {key.removesuffix(".vel"): val for key, val in action.items() if key.endswith(".vel")}
 
         # Apply joint limit clipping
         for motor_name, position in goal_pos.items():
@@ -294,6 +294,10 @@ class SeeedB601FollowerBase(Robot):
                 if clipped_position != position:
                     logger.debug(f"Clipped {motor_name} from {position:.2f} to {clipped_position:.2f}")
                 goal_pos[motor_name] = clipped_position
+
+        # To tolerate 6-DOF leader arms that don't have a wrist_yaw joint, we can allow the follower to ignore missing wrist_yaw commands by treating them as 0.
+        if 'wrist_yaw' not in goal_pos:
+            goal_pos['wrist_yaw'] = 0.0
 
         # Safety: Cap relative target
         if self.config.max_relative_target is not None:
@@ -317,16 +321,7 @@ class SeeedB601FollowerBase(Robot):
                 idx = 0 # Fallback
 
             # Convert target position from degrees to radians for motorbridge
-            pos_rad = math.radians(position_degrees)
-            # if motor_name in goal_vel:
-            #     vel_deg_s = goal_vel[motor_name]
-            # else:
-            #     vel_deg_s = (
-            #         self.config.pos_vel_velocity[idx]
-            #         if isinstance(self.config.pos_vel_velocity, list)
-            #         else self.config.pos_vel_velocity
-            #     )
-            
+            pos_rad = math.radians(position_degrees)           
 
             motor = self.motors.get(motor_name)
             if motor is not None:
@@ -343,7 +338,7 @@ class SeeedB601FollowerBase(Robot):
                         else self.config.gripper_mit_kd
                     )
                     motor.send_mit(pos_rad, 0.0, kp, kd, 0.0)
-                    print(f"Sent MIT command to {motor_name}: pos={position_degrees:.2f}°, kp={kp}, kd={kd}")
+                    logger.debug(f"Sent MIT command to {motor_name}: pos={position_degrees:.2f}°, kp={kp}, kd={kd}")
                 else:
                     vel_deg_s = (
                         self.config.pos_vel_velocity[idx]
@@ -352,7 +347,7 @@ class SeeedB601FollowerBase(Robot):
                     )
                     vel_rad = math.radians(vel_deg_s)
                     motor.send_pos_vel(pos_rad, vel_rad)
-                    print(f"Sent POS_VEL command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
+                    logger.debug(f"Sent POS_VEL command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
 
         # motorbridge sends packets mostly synchronously here over loop, 
         # so we don't need a bulk send command through ctypes.
@@ -364,10 +359,13 @@ class SeeedB601FollowerBase(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if self.config.disable_torque_on_disconnect:
-            for motor in self.motors.values():
+        for motor in self.motors.values():
+            if self.config.disable_torque_on_disconnect:
                 motor.disable()
-
+            motor.clear_error()
+            motor.close()
+        
+        self.bus.close_bus()
         self.bus.close()
         self.bus = None
 

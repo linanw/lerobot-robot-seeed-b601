@@ -7,19 +7,14 @@ from .seeed_b601_follower import SeeedB601FollowerConfigBase
 @RobotConfig.register_subclass("seeed_b601_dm_follower")
 @dataclass
 class SeeedB601DMFollowerConfig(RobotConfig, SeeedB601FollowerConfigBase):
+    # The Kp parameter for the MIT control mode of the gripper.
     gripper_mit_kp: float = 80.0
+
+    # The Kd parameter for the MIT control mode of the gripper.
     gripper_mit_kd: float = 0.5
+
+    # The v_des parameter for the position-velocity control mode of the joints.
     pos_vel_velocity: float | list[float] = field(
         default_factory=lambda: [300, 300, 300, 300, 300, 300]
     )
-    motor_models: dict[str, str] = field(
-        default_factory=lambda: {
-            "joint_1": "dm4340",
-            "joint_2": "dm4340",
-            "joint_3": "dm4340",
-            "joint_4": "dm4310",
-            "joint_5": "dm4310",
-            "joint_6": "dm4310",
-            "gripper": "dm4310",
-        }
-    )
+
