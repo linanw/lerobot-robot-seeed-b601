@@ -54,11 +54,11 @@ class SeeedB601FollowerConfigBase:
 
     # Control parameters are defined by concrete subclasses so different motor families
     # can keep their own defaults.
-    # MIT gains used only by the gripper motor.
-    gripper_mit_kp: float = 0.0
-    gripper_mit_kd: float = 0.0
-    # Default target velocity for joints running in POS_VEL mode, in degrees/s.
+    ## Default target velocity for joints running in POS_VEL mode, in degrees/s.
     pos_vel_velocity: float | list[float] = field(default_factory=list)
+
+    ## Default torque/current ration for gripper's FORCE_POS mode, in range [0,1].
+    force_pos_torque_ration: float = 0.1
 
     # Values for joint limits (Degrees)
     # Note: These are soft limits. Physical verification is recommended.
@@ -79,7 +79,8 @@ logger = logging.getLogger(__name__)
 
 
 FOLLOWER_GRIPPER_MOTOR = "gripper"
-
+LONG_TIMEOUT_SEC = 0.1
+MEDIUM_TIMEOUT_SEC = 0.01
 
 class SeeedB601FollowerBase(Robot):
     """
@@ -155,20 +156,22 @@ class SeeedB601FollowerBase(Robot):
         
         self._add_motors_to_bus()
 
-        if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
-            self.calibrate()
+        # if not self.is_calibrated and calibrate:
+        #     logger.info(
+        #         "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
+        #     )
+        #     self.calibrate()
+        self.calibrate()
 
         for cam in self.cameras.values():
             cam.connect()
 
-        self.configure()
+        # if self.is_calibrated:
+        #     for motor in self.motors.values():
+        #         motor.set_zero_position()
+        #         time.sleep(LONG_TIMEOUT_SEC)
 
-        if self.is_calibrated:
-            for motor in self.motors.values():
-                motor.set_zero_position()
+        self.configure()
 
         logger.info(f"{self} connected.")
 
@@ -179,31 +182,32 @@ class SeeedB601FollowerBase(Robot):
 
     def calibrate(self) -> None:
         """Calibration procedure for B601."""
-        if self.calibration:
-            user_input = input(
-                f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
-            )
-            if user_input.strip().lower() != "c":
-                logger.info(f"Using calibration file associated with the id {self.id}")
-                return
+        # if self.calibration:
+        #     user_input = input(
+        #         f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
+        #     )
+        #     if user_input.strip().lower() != "c":
+        #         logger.info(f"Using calibration file associated with the id {self.id}")
+        #         return
 
         logger.info(f"\nRunning calibration for {self}")
         
-        for motor in self.motors.values():
-            motor.disable()
+        self.bus.disable_all()
 
         print(
             "\nCalibration: Set Zero Position\n"
-            "Please MANUALLY move the robot to its ZERO POSITION.\n"
+            "Please MANUALLY move the robot to its ZERO POSITION, and close its gripper.\n"
             "Reference the B601 manual for Zero Pose (generally the default sit-down position).\n"
         )
-        input("Press ENTER when the robot is in ZERO POSITION...")
+        input("Press ENTER when ready...")
 
         for motor in self.motors.values():
             motor.set_zero_position()
+            time.sleep(LONG_TIMEOUT_SEC)
+        time.sleep(1)
         logger.info("Arm zero position set.")
 
-        logger.info("Setting range: -90° to +90° by default for all joints")
+        # logger.info("Setting range: -90° to +90° by default for all joints")
         for motor_name, (send_id, recv_id) in self.config.motor_can_ids.items():
             self.calibration[motor_name] = MotorCalibration(
                 id=send_id,
@@ -214,27 +218,27 @@ class SeeedB601FollowerBase(Robot):
             )
 
         self._save_calibration()
-        print(f"Calibration saved to {self.calibration_fpath}")
+        # print(f"Calibration saved to {self.calibration_fpath}")
 
     def configure(self) -> None:
         """Configure motors with appropriate settings."""
         self.bus.enable_all()
-
-        # Damiao motors need a short delay after enable before register operations
-        time.sleep(0.3)
-
+        num_retry = 9
         for motor_name, motor in self.motors.items():
             target_mode = (
-                MotorBridgeMode.MIT
+                MotorBridgeMode.FORCE_POS
                 if motor_name == FOLLOWER_GRIPPER_MOTOR
                 else MotorBridgeMode.POS_VEL
             )
-            try:
-                motor.ensure_mode(target_mode)
-            except Exception:
-                logger.warning(
-                    f"ensure_mode({target_mode.name}) failed for {motor_name}, continuing anyway"
-                )
+            for _ in range(num_retry + 1):
+                try:
+                    motor.ensure_mode(target_mode)
+                    break
+                except Exception as e:
+                    if _ == num_retry:
+                        raise e
+                    time.sleep(MEDIUM_TIMEOUT_SEC)
+            logger.info(f"{motor_name} ensure mode {target_mode}")
 
     def get_observation(self) -> RobotObservation:
         """Get current observation from robot."""
@@ -249,7 +253,10 @@ class SeeedB601FollowerBase(Robot):
         for motor in self.motors.values():
             motor.request_feedback()
 
-        self.bus.poll_feedback_once()
+        try:
+            self.bus.poll_feedback_once()
+        except:
+            logger.warning(f"can bus poll feedback failed.")
 
         for motor_name, motor in self.motors.items():
             state = motor.get_state()
@@ -275,9 +282,7 @@ class SeeedB601FollowerBase(Robot):
 
     def send_action(
         self,
-        action: RobotAction,
-        custom_gripper_mit_kp: float | None = None,
-        custom_gripper_mit_kd: float | None = None,
+        action: RobotAction
     ) -> RobotAction:
         """Send action command to robot."""
         if not self.is_connected:
@@ -321,31 +326,20 @@ class SeeedB601FollowerBase(Robot):
                 idx = 0 # Fallback
 
             # Convert target position from degrees to radians for motorbridge
-            pos_rad = math.radians(position_degrees)           
+            pos_rad = math.radians(position_degrees)
+            vel_deg_s = (
+                self.config.pos_vel_velocity[idx]
+                if isinstance(self.config.pos_vel_velocity, list)
+                else self.config.pos_vel_velocity
+            )
+            vel_rad = math.radians(vel_deg_s)
 
             motor = self.motors.get(motor_name)
             if motor is not None:
                 if motor_name == FOLLOWER_GRIPPER_MOTOR:
-                    # Keep the gripper in MIT mode for finer compliance control.
-                    kp = (
-                        custom_gripper_mit_kp
-                        if custom_gripper_mit_kp is not None
-                        else self.config.gripper_mit_kp
-                    )
-                    kd = (
-                        custom_gripper_mit_kd
-                        if custom_gripper_mit_kd is not None
-                        else self.config.gripper_mit_kd
-                    )
-                    motor.send_mit(pos_rad, 0.0, kp, kd, 0.0)
-                    logger.debug(f"Sent MIT command to {motor_name}: pos={position_degrees:.2f}°, kp={kp}, kd={kd}")
+                    motor.send_force_pos(pos_rad, vel_rad, self.config.force_pos_torque_ration)
+                    logger.debug(f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}")
                 else:
-                    vel_deg_s = (
-                        self.config.pos_vel_velocity[idx]
-                        if isinstance(self.config.pos_vel_velocity, list)
-                        else self.config.pos_vel_velocity
-                    )
-                    vel_rad = math.radians(vel_deg_s)
                     motor.send_pos_vel(pos_rad, vel_rad)
                     logger.debug(f"Sent POS_VEL command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
 
@@ -365,7 +359,6 @@ class SeeedB601FollowerBase(Robot):
             motor.clear_error()
             motor.close()
         
-        self.bus.close_bus()
         self.bus.close()
         self.bus = None
 
