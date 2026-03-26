@@ -1,72 +1,130 @@
 # Seeed reBot Arm B601 Follower Integration with LeRobot
 
-This repository provides the integration for the **reBot Arm B601** with the [LeRobot](https://github.com/huggingface/lerobot) framework. It enables the B601 arm to be used as the follower.
+This repository provides the **Follower Arm (Robot)** integration for the **reBot Arm B601** with the [LeRobot](https://github.com/huggingface/lerobot) framework. It enables the B601 arm to be used as a follower robot in teleoperation and data collection workflows.
 
 ## Supported Hardware
 
 *   **Robot**: Seeed reBot Arm B601 Series (6-DOF + Gripper)
 *   **Motors**: Damiao (DM4340 + DM4310), RobStride
-*   **Communication**: CAN Bus (via USB-CAN adapter, e.g., derivatives of Candle/slcan or SocketCAN compatible devices)
+*   **Communication**: CAN bus via USB-CAN adapter, including SocketCAN-compatible adapters and Damiao's USB2CAN adapter
 
 ## Installation
 
 1.  **Install LeRobot**:
-    Follow the instructions in the [LeRobot repository](https://github.com/huggingface/lerobot) to install the base library.
+    Follow the instructions in the [LeRobot repository](https://github.com/huggingface/lerobot) to install the base library. A very quick summary is shown below.
 
-2.  **Install this package**:
-    Clone this repository and install in editable mode:
+    ```shell
+    conda create -y -n lerobot python=3.12
+    conda activate lerobot
+    conda install ffmpeg -c conda-forge
+    git clone https://github.com/huggingface/lerobot.git
+    cd lerobot
+    pip install -e .
+    ```
+
+2.  **Install the `motorbridge` Python package**:
+
+    ```shell
+    # Go to https://github.com/tianrking/motorbridge/releases
+    # Download the wheel that matches your platform and Python version
+    # Example for Ubuntu x86_64 with Python 3.12:
+    pip install motorbridge-0.1.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+
+    # TODO: switch to pip install from PyPI once published
+    ```
+
+    You can also install the optional `motor_cli` utility:
+
+    ```shell
+    wget https://github.com/tianrking/motorbridge/releases/download/v0.1.5/motor-cli-v0.1.5-linux-x86_64.tar.gz
+    tar zxvf motor-cli-v0.1.5-linux-x86_64.tar.gz
+    sudo cp motor-cli-v0.1.5-linux-x86_64/bin/motor_cli /usr/local/bin/
+    sudo chmod a+x /usr/local/bin/motor_cli
+    ```
+
+3.  **Install this package**:
+    Clone this repository and install it in editable mode:
+
     ```bash
-    git clone https://github.com/Seeed-Studio/lerobot-robot-seeed-b601.git
+    git clone https://github.com/Seeed-Projects/lerobot-robot-seeed-b601.git
     cd lerobot-robot-seeed-b601
     pip install -e .
     ```
 
     Or install from PyPI:
+
     ```bash
     pip install lerobot-robot-seeed-b601
     ```
 
-    Upon the installation, the Seeed reBot Arm B601 will be registered in LeRobot. Two variants are registered:
-    *   `lerobot_robot_seeed_b601_dm`: B601 using Damiao motors (6-DOF + Gripper)
-    *   `lerobot_robot_seeed_b601_rs`: B601 using RobStride motors (6-DOF + Gripper)
+    Upon installation, two robot variants are registered:
+    *   `seeed_b601_dm_follower`: B601 follower using Damiao motors - **Primary supported path**
+    *   `seeed_b601_rs_follower`: B601 follower using RobStride motors - **Registered, still being refined**
+
+    ```shell
+    # Verify that the follower configs are visible to LeRobot
+    lerobot-teleoperate --help | grep SeeedB601
+
+    # Expected output includes
+    SeeedB601DMFollowerConfig ['robot']:
+    SeeedB601RSFollowerConfig ['robot']:
+    ```
 
 ## Configuration
 
-The default configuration for B601-DM is located in `lerobot_robot_seeed_b601/config_seeed_b601_dm.py`.
+Default motor mapping for the B601 follower:
 
-*   **Motor IDs**: 0x01 - 0x06 (Joints), 0x07 (Gripper)
-*   **Motor Types**:
-    *   Joint 1, 4, 5, 6, Gripper: `dm4310`
-    *   Joint 2, 3: `dm4340`
+*   `shoulder_pan`: master ID `0x01`, feedback ID `0x11`, motor model `dm4340p`
+*   `shoulder_lift`: master ID `0x02`, feedback ID `0x12`, motor model `dm4340p`
+*   `elbow_flex`: master ID `0x03`, feedback ID `0x13`, motor model `dm4340p`
+*   `wrist_flex`: master ID `0x04`, feedback ID `0x14`, motor model `dm4310`
+*   `wrist_roll`: master ID `0x05`, feedback ID `0x15`, motor model `dm4310`
+*   `wrist_yaw`: master ID `0x06`, feedback ID `0x16`, motor model `dm4310`
+*   `gripper`: master ID `0x07`, feedback ID `0x17`, motor model `dm4310`
 
-Ensure your robot's motor IDs match this configuration.
+*   **CAN adapter types**:
+    *   `socketcan`: for SocketCAN-compatible adapters such as `can0`
+    *   `damiao`: for Damiao serial bridge adapters such as `/dev/ttyACM0`
+    *   `robstride`: registered in config, but the dedicated adapter path is not yet supported by the current `motorbridge` Python SDK integration
 
-TODO: Refer to the wiki page where shows the guide to configure the motors.
+Make sure your actual motor names, IDs, wiring, and motor models match these defaults before running calibration or teleoperation.
 
 ## Usage
 
-### Quick Start
+### Pair a follower with a B601 leader
 
-A simple verification script is provided to test the connection and basic motor control without loading the full LeRobot gym environment.
-
-**1. Connect to the robot:**
-```bash
-# Replace /dev/tty.usbmodem* with your actual CAN port (e.g., can0 on Linux)
-python examples/verification_dm.py --port /dev/tty.usbmodem12345 --action connect
+```shell
+lerobot-teleoperate \
+    --robot.type=seeed_b601_dm_follower \
+    --robot.id=follower1 \
+    --robot.port=/dev/ttyACM4 \
+    --robot.can_adapter=damiao \
+    --teleop.type=seeed_b601_dm_leader \
+    --teleop.id=leader1 \
+    --teleop.port=/dev/ttyACM5 \
+    --teleop.can_adapter=damiao
 ```
 
-**2. Read motor states:**
-```bash
-python examples/verification_dm.py --port /dev/tty.usbmodem12345 --action read
+### Teleoperate with follower cameras
+
+```shell
+lerobot-teleoperate \
+    --robot.type=seeed_b601_dm_follower \
+    --robot.id=my_b601_follower \
+    --robot.port=/dev/ttyACM4 \
+    --robot.can_adapter=damiao \
+    --robot.cameras="{ up: {type: opencv, index_or_path: /dev/video10, width: 640, height: 480, fps: 30}, side: {type: intelrealsense, serial_number_or_name: 233522074606, width: 640, height: 480, fps: 30}}" \
+    --teleop.type=seeed_b601_dm_leader \
+    --teleop.id=my_b601_leader \
+    --teleop.port=/dev/ttyACM5 \
+    --teleop.can_adapter=damiao \
+    --display_data=true
 ```
-This will continuously print the current joint positions. Manually move the robot arm to verify that the readings change.
 
-**3. Move a joint (Caution):**
-```bash
-# Example: Move Joint 6 to 5 degrees
-python examples/verification_dm.py --port /dev/tty.usbmodem12345 --action move --joint joint_6 --angle 5
-```
+Fore more lerobot operations, please refer to the lerobot official documentation:
 
-### Use within the LeRobot
+https://huggingface.co/docs/lerobot/il_robots
 
-TODO: Write the guide to use this robot within the LeRobot.
+## Notes
+
+*   About calibration: the reBot Arm doesn't need an explicit calibration, it only reset every motor's zero position on the launch time of the lerobot scripts.
