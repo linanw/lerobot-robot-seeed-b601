@@ -10,7 +10,7 @@ class SeeedB601DMFollowerConfig(RobotConfig, SeeedB601FollowerConfigBase):
 
     # The v_des parameter for the position-velocity control mode of the joints.
     pos_vel_velocity: float | list[float] = field(
-        default_factory=lambda: [300, 300, 300, 300, 300, 300, 300]
+        default_factory=lambda: [150, 150, 150, 150, 150, 150, 150]
     )
 
     # Default torque/current ration for gripper's FORCE_POS mode, in range [0,1].
