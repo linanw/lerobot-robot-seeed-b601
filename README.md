@@ -78,8 +78,8 @@ Default motor mapping for the B601 follower:
 *   `shoulder_lift`: master ID `0x02`, feedback ID `0x12`, motor model `dm4340p`
 *   `elbow_flex`: master ID `0x03`, feedback ID `0x13`, motor model `dm4340p`
 *   `wrist_flex`: master ID `0x04`, feedback ID `0x14`, motor model `dm4310`
-*   `wrist_roll`: master ID `0x05`, feedback ID `0x15`, motor model `dm4310`
-*   `wrist_yaw`: master ID `0x06`, feedback ID `0x16`, motor model `dm4310`
+*   `wrist_yaw`: master ID `0x05`, feedback ID `0x15`, motor model `dm4310`
+*   `wrist_roll`: master ID `0x06`, feedback ID `0x16`, motor model `dm4310`
 *   `gripper`: master ID `0x07`, feedback ID `0x17`, motor model `dm4310`
 
 *   **CAN adapter types**:

@@ -46,8 +46,8 @@ class SeeedB601FollowerConfigBase:
             "shoulder_lift": (0x02, 0x12),
             "elbow_flex":    (0x03, 0x13),
             "wrist_flex":    (0x04, 0x14),
-            "wrist_roll":    (0x05, 0x15),
-            "wrist_yaw":     (0x06, 0x16),
+            "wrist_yaw":     (0x05, 0x15),
+            "wrist_roll":    (0x06, 0x16),
             "gripper":       (0x07, 0x17),
         }
     )
@@ -68,8 +68,8 @@ class SeeedB601FollowerConfigBase:
             "shoulder_lift": (-170.0, 1.0),
             "elbow_flex":    (-200.0, 1.0),
             "wrist_flex":    (-80.0, 90.0),
-            "wrist_roll":    (-90.0, 90.0),
             "wrist_yaw":     (-90.0, 90.0),
+            "wrist_roll":    (-90.0, 90.0),
             "gripper":       (-270.0, 0.0),
         }
     )
@@ -104,8 +104,8 @@ class SeeedB601FollowerBase(Robot):
         features: dict[str, type] = {}
         for motor in self.motor_names:
             features[f"{motor}.pos"] = float
-            features[f"{motor}.vel"] = float
-            features[f"{motor}.torque"] = float
+            # features[f"{motor}.vel"] = float
+            # features[f"{motor}.torque"] = float
         return features
 
     @property
@@ -204,7 +204,7 @@ class SeeedB601FollowerBase(Robot):
         for motor in self.motors.values():
             motor.set_zero_position()
             time.sleep(LONG_TIMEOUT_SEC)
-        time.sleep(1)
+        
         logger.info("Arm zero position set.")
 
         # logger.info("Setting range: -90° to +90° by default for all joints")
@@ -239,6 +239,14 @@ class SeeedB601FollowerBase(Robot):
                         raise e
                     time.sleep(MEDIUM_TIMEOUT_SEC)
             logger.info(f"{motor_name} ensure mode {target_mode}")
+
+    def disable_torque(self) -> None:
+        """Disable follower motor torque so the arm can be moved by hand during read-only debugging."""
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        self.bus.disable_all()
+        logger.info(f"{self} torque disabled.")
 
     def get_observation(self) -> RobotObservation:
         """Get current observation from robot."""
