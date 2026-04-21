@@ -34,6 +34,7 @@ class SeeedB601FollowerConfigBase:
 
     disable_torque_on_disconnect: bool = True
 
+    # Max relative target for joint movements, in degrees
     max_relative_target: float | dict[str, float] | None = None
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
@@ -156,20 +157,14 @@ class SeeedB601FollowerBase(Robot):
         
         self._add_motors_to_bus()
 
-        # if not self.is_calibrated and calibrate:
-        #     logger.info(
-        #         "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-        #     )
-        #     self.calibrate()
-        self.calibrate()
+        if not self.is_calibrated and calibrate:
+            logger.info(
+                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
+            )
+            self.calibrate()
 
         for cam in self.cameras.values():
             cam.connect()
-
-        # if self.is_calibrated:
-        #     for motor in self.motors.values():
-        #         motor.set_zero_position()
-        #         time.sleep(LONG_TIMEOUT_SEC)
 
         self.configure()
 
@@ -182,13 +177,13 @@ class SeeedB601FollowerBase(Robot):
 
     def calibrate(self) -> None:
         """Calibration procedure for B601."""
-        # if self.calibration:
-        #     user_input = input(
-        #         f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
-        #     )
-        #     if user_input.strip().lower() != "c":
-        #         logger.info(f"Using calibration file associated with the id {self.id}")
-        #         return
+        if self.calibration:
+            user_input = input(
+                f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
+            )
+            if user_input.strip().lower() != "c":
+                logger.info(f"Using calibration file associated with the id {self.id}")
+                return
 
         logger.info(f"\nRunning calibration for {self}")
         
@@ -207,7 +202,8 @@ class SeeedB601FollowerBase(Robot):
         
         logger.info("Arm zero position set.")
 
-        # logger.info("Setting range: -90° to +90° by default for all joints")
+        logger.info("Setting range: -90° to +90° by default for all joints")
+        self.calibration = {}
         for motor_name, (send_id, recv_id) in self.config.motor_can_ids.items():
             self.calibration[motor_name] = MotorCalibration(
                 id=send_id,
@@ -218,7 +214,7 @@ class SeeedB601FollowerBase(Robot):
             )
 
         self._save_calibration()
-        # print(f"Calibration saved to {self.calibration_fpath}")
+        print(f"Calibration saved to {self.calibration_fpath}")
 
     def configure(self) -> None:
         """Configure motors with appropriate settings."""
