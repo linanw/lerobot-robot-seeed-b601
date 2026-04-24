@@ -221,8 +221,12 @@ class SeeedB601FollowerBase(Robot):
         self.bus.enable_all()
         num_retry = 9
         for motor_name, motor in self.motors.items():
+            motor_model = str(getattr(self, "motor_model_mapping", {}).get(motor_name, "")).lower()
+            is_rs_motor = motor_model.startswith("rs")
             target_mode = (
-                MotorBridgeMode.FORCE_POS
+                MotorBridgeMode.MIT
+                if motor_name == FOLLOWER_GRIPPER_MOTOR and is_rs_motor
+                else MotorBridgeMode.FORCE_POS
                 if motor_name == FOLLOWER_GRIPPER_MOTOR
                 else MotorBridgeMode.POS_VEL
             )
@@ -243,6 +247,14 @@ class SeeedB601FollowerBase(Robot):
 
         self.bus.disable_all()
         logger.info(f"{self} torque disabled.")
+
+    def mit_output_torque_limit(
+        self,
+        motor: Any,
+        pos_target_rad: float,
+    ) -> float | None:
+        """Compute MIT torque command from target position and motor state."""
+        return 0.0
 
     def get_observation(self) -> RobotObservation:
         """Get current observation from robot."""
@@ -341,8 +353,20 @@ class SeeedB601FollowerBase(Robot):
             motor = self.motors.get(motor_name)
             if motor is not None:
                 if motor_name == FOLLOWER_GRIPPER_MOTOR:
-                    motor.send_force_pos(pos_rad, vel_rad, self.config.force_pos_torque_ration)
-                    logger.debug(f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}")
+                    motor_model = str(getattr(self, "motor_model_mapping", {}).get(motor_name, "")).lower()
+                    is_rs_motor = motor_model.startswith("rs")
+                    if is_rs_motor:
+                        tau_ff = self.mit_output_torque_limit(motor, pos_rad)
+                        if tau_ff is None:
+                            tau_ff = 0.0
+                        motor.send_mit(0, 0, 0, 0.2, tau_ff)
+                        logger.debug(
+                            f"Sent MIT command to {motor_name}: pos={position_degrees:.2f}°, "
+                            f"tau_ff={tau_ff:.2f}"
+                        )
+                    else:
+                        motor.send_force_pos(pos_rad, vel_rad, self.config.force_pos_torque_ration)
+                        logger.debug(f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}")
                 else:
                     motor.send_pos_vel(pos_rad, vel_rad)
                     logger.debug(f"Sent POS_VEL command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
