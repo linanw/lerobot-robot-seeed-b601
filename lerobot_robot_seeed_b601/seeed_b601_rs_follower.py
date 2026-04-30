@@ -10,6 +10,7 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
 
     config_class = SeeedB601RSFollowerConfig
     name = "seeed_b601_rs_follower"
+    motor_type = "rs"
 
     motor_model_mapping = {
         "shoulder_pan":  "rs-04",
@@ -67,12 +68,12 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
         target_vel = max(-target_vel_max, min(target_vel_max, filtered_target_vel))
         self._gripper_prev_filtered_target_vel = target_vel
 
-        kp = float(getattr(self.config, "gripper_mit_kp", 0.0))
-        kd = float(getattr(self.config, "gripper_mit_kd", 0.0))
+        kp = float(self.config.gripper_mit_kp)
+        kd = float(self.config.gripper_mit_kd)
         impedance_torque = (
             kp * (pos_target - state.pos)
             + kd * (target_vel - state.vel)
         )
 
-        max_torque = max(0.0, float(getattr(self.config, "gripper_mit_torque_limit", 2.0)))
+        max_torque = max(0.0, float(self.config.gripper_mit_torque_limit))
         return max(-max_torque, min(max_torque, impedance_torque))

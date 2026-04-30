@@ -89,6 +89,8 @@ class SeeedB601FollowerBase(Robot):
     Uses CAN bus communication via motorbridge.
     """
 
+    motor_type: str = ""
+
     def __init__(self, config: SeeedB601FollowerConfigBase):
         super().__init__(config)
         self.config = config
@@ -221,11 +223,9 @@ class SeeedB601FollowerBase(Robot):
         self.bus.enable_all()
         num_retry = 9
         for motor_name, motor in self.motors.items():
-            motor_model = str(getattr(self, "motor_model_mapping", {}).get(motor_name, "")).lower()
-            is_rs_motor = motor_model.startswith("rs")
             target_mode = (
                 MotorBridgeMode.MIT
-                if motor_name == FOLLOWER_GRIPPER_MOTOR and is_rs_motor
+                if motor_name == FOLLOWER_GRIPPER_MOTOR and self.motor_type == "rs"
                 else MotorBridgeMode.FORCE_POS
                 if motor_name == FOLLOWER_GRIPPER_MOTOR
                 else MotorBridgeMode.POS_VEL
@@ -353,9 +353,7 @@ class SeeedB601FollowerBase(Robot):
             motor = self.motors.get(motor_name)
             if motor is not None:
                 if motor_name == FOLLOWER_GRIPPER_MOTOR:
-                    motor_model = str(getattr(self, "motor_model_mapping", {}).get(motor_name, "")).lower()
-                    is_rs_motor = motor_model.startswith("rs")
-                    if is_rs_motor:
+                    if self.motor_type == "rs":
                         tau_ff = self.mit_output_torque_limit(motor, pos_rad)
                         if tau_ff is None:
                             tau_ff = 0.0
