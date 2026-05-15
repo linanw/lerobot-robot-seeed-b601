@@ -43,13 +43,13 @@ class SeeedB601FollowerConfigBase:
     # Maps motor names to (send_can_id, recv_can_id)
     motor_can_ids: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
-            "shoulder_pan":  (0x01, 0x11),
-            "shoulder_lift": (0x02, 0x12),
-            "elbow_flex":    (0x03, 0x13),
-            "wrist_flex":    (0x04, 0x14),
-            "wrist_yaw":     (0x05, 0x15),
-            "wrist_roll":    (0x06, 0x16),
-            "gripper":       (0x07, 0x17),
+            "shoulder_pan":  (0x01, 0xFD ),
+            "shoulder_lift": (0x02, 0xFD ),
+            "elbow_flex":    (0x03, 0xFD ),
+            "wrist_flex":    (0x04, 0xFD ),
+            "wrist_yaw":     (0x05, 0xFD ),
+            "wrist_roll":    (0x06, 0xFD ),
+            "gripper":       (0x07, 0xFD ),
         }
     )
 
@@ -64,14 +64,23 @@ class SeeedB601FollowerConfigBase:
     # Values for joint limits (Degrees)
     # Note: These are soft limits. Physical verification is recommended.
     joint_limits: dict[str, tuple[float, float]] = field(
+        # default_factory=lambda: {
+        #     "shoulder_pan":  (-145.0, 145.0),
+        #     "shoulder_lift": (-170.0, 1.0),
+        #     "elbow_flex":    (-200.0, 1.0),
+        #     "wrist_flex":    (-80.0, 90.0),
+        #     "wrist_yaw":     (-90.0, 90.0),
+        #     "wrist_roll":    (-90.0, 90.0),
+        #     "gripper":       (-270.0, 0.0),
+        # }
         default_factory=lambda: {
             "shoulder_pan":  (-145.0, 145.0),
-            "shoulder_lift": (-170.0, 1.0),
-            "elbow_flex":    (-200.0, 1.0),
+            "shoulder_lift": (-1.0, 170.0),
+            "elbow_flex":    (-1.0, 200.0),
             "wrist_flex":    (-80.0, 90.0),
             "wrist_yaw":     (-90.0, 90.0),
             "wrist_roll":    (-90.0, 90.0),
-            "gripper":       (-270.0, 0.0),
+            "gripper":       (-0.0, 270.0),
         }
     )
 
@@ -220,7 +229,8 @@ class SeeedB601FollowerBase(Robot):
 
     def configure(self) -> None:
         """Configure motors with appropriate settings."""
-        self.bus.enable_all()
+        # Keep torque off while switching modes, then enable after all motors are configured.
+        self.bus.disable_all()
         num_retry = 9
         for motor_name, motor in self.motors.items():
             target_mode = (
@@ -239,6 +249,7 @@ class SeeedB601FollowerBase(Robot):
                         raise e
                     time.sleep(MEDIUM_TIMEOUT_SEC)
             logger.info(f"{motor_name} ensure mode {target_mode}")
+        self.bus.enable_all()
 
     def disable_torque(self) -> None:
         """Disable follower motor torque so the arm can be moved by hand during read-only debugging."""
@@ -357,7 +368,7 @@ class SeeedB601FollowerBase(Robot):
                         tau_ff = self.mit_output_torque_limit(motor, pos_rad)
                         if tau_ff is None:
                             tau_ff = 0.0
-                        motor.send_mit(0, 0, 0, 0.2, tau_ff)
+                        motor.send_mit(0, 0, 0, 1.5, tau_ff)
                         logger.debug(
                             f"Sent MIT command to {motor_name}: pos={position_degrees:.2f}°, "
                             f"tau_ff={tau_ff:.2f}"
@@ -367,7 +378,7 @@ class SeeedB601FollowerBase(Robot):
                         logger.debug(f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}")
                 else:
                     motor.send_pos_vel(pos_rad, vel_rad)
-                    logger.debug(f"Sent POS_VEL command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
+                    logger.debug(f"Sent POS_VEL command to {motor_name}: target={pos_rad:.2f},pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
 
         # motorbridge sends packets mostly synchronously here over loop, 
         # so we don't need a bulk send command through ctypes.
@@ -382,7 +393,8 @@ class SeeedB601FollowerBase(Robot):
         for motor in self.motors.values():
             if self.config.disable_torque_on_disconnect:
                 motor.disable()
-            motor.clear_error()
+            if self.motor_type != "rs":
+                motor.clear_error()
             motor.close()
         
         self.bus.close()

@@ -1,5 +1,9 @@
+import logging
+
 from .config_seeed_b601_rs_follower import SeeedB601RSFollowerConfig
 from .seeed_b601_follower import SeeedB601FollowerBase
+
+logger = logging.getLogger(__name__)
 
 
 class SeeedB601RSFollower(SeeedB601FollowerBase):
@@ -13,19 +17,19 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
     motor_type = "rs"
 
     motor_model_mapping = {
-        "shoulder_pan":  "rs-04",
-        "shoulder_lift": "rs-04",
-        "elbow_flex":    "rs-04",
-        "wrist_flex":    "rs-02",
-        "wrist_yaw":     "rs-02",
-        "wrist_roll":    "rs-02",
-        "gripper":       "rs-02",
+        "shoulder_pan":  "rs-06",
+        "shoulder_lift": "rs-06",
+        "elbow_flex":    "rs-06",
+        "wrist_flex":    "rs-00",
+        "wrist_yaw":     "rs-00",
+        "wrist_roll":    "rs-00",
+        "gripper":       "rs-00",
     }
 
     def _add_motors_to_bus(self):
         for motor_name, (send_id, recv_id) in self.config.motor_can_ids.items():
             motor_type_str = self.motor_model_mapping[motor_name]
-            self.motors[motor_name] = self.bus.add_damiao_motor(send_id, recv_id, motor_type_str.upper())
+            self.motors[motor_name] = self.bus.add_robstride_motor(send_id, recv_id, motor_type_str)
 
     def mit_output_torque_limit(
         self,
@@ -34,6 +38,7 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
     ) -> float | None:
         if motor is None:
             return None
+        self.bus.poll_feedback_once()
         state = motor.get_state()
         if state is None:
             return None
@@ -74,6 +79,15 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
             kp * (pos_target - state.pos)
             + kd * (target_vel - state.vel)
         )
+        logger.debug(
+            "Gripper MIT terms: pos_target=%.4f rad, state_pos=%.4f rad, "
+            "target_vel=%.4f rad/s, state_vel=%.4f rad/s",
+            pos_target,
+            state.pos,
+            target_vel,
+            state.vel,
+        )
 
         max_torque = max(0.0, float(self.config.gripper_mit_torque_limit))
+        motor.request_feedback()
         return max(-max_torque, min(max_torque, impedance_torque))
