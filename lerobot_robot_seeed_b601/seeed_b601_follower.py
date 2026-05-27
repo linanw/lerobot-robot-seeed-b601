@@ -39,19 +39,9 @@ class SeeedB601FollowerConfigBase:
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     
-    # Motor configuration for B601 (6 DOF + Gripper)
+    # Motor configuration must be provided by concrete subclasses.
     # Maps motor names to (send_can_id, recv_can_id)
-    motor_can_ids: dict[str, tuple[int, int]] = field(
-        default_factory=lambda: {
-            "shoulder_pan":  (0x01, 0xFD ),
-            "shoulder_lift": (0x02, 0xFD ),
-            "elbow_flex":    (0x03, 0xFD ),
-            "wrist_flex":    (0x04, 0xFD ),
-            "wrist_yaw":     (0x05, 0xFD ),
-            "wrist_roll":    (0x06, 0xFD ),
-            "gripper":       (0x07, 0xFD ),
-        }
-    )
+    motor_can_ids: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     # Control parameters are defined by concrete subclasses so different motor families
     # can keep their own defaults.
@@ -61,28 +51,12 @@ class SeeedB601FollowerConfigBase:
     ## Default torque/current ration for gripper's FORCE_POS mode, in range [0,1].
     force_pos_torque_ration: float = 0.1
 
-    # Values for joint limits (Degrees)
-    # Note: These are soft limits. Physical verification is recommended.
-    joint_limits: dict[str, tuple[float, float]] = field(
-        # default_factory=lambda: {
-        #     "shoulder_pan":  (-145.0, 145.0),
-        #     "shoulder_lift": (-170.0, 1.0),
-        #     "elbow_flex":    (-200.0, 1.0),
-        #     "wrist_flex":    (-80.0, 90.0),
-        #     "wrist_yaw":     (-90.0, 90.0),
-        #     "wrist_roll":    (-90.0, 90.0),
-        #     "gripper":       (-270.0, 0.0),
-        # }
-        default_factory=lambda: {
-            "shoulder_pan":  (-145.0, 145.0),
-            "shoulder_lift": (-1.0, 170.0),
-            "elbow_flex":    (-1.0, 200.0),
-            "wrist_flex":    (-80.0, 90.0),
-            "wrist_yaw":     (-90.0, 90.0),
-            "wrist_roll":    (-90.0, 90.0),
-            "gripper":       (-0.0, 270.0),
-        }
-    )
+    # Soft joint limits in degrees. Concrete subclasses should define defaults.
+    joint_limits: dict[str, tuple[float, float]] = field(default_factory=dict)
+
+    # Per-joint action direction/scale applied before joint-limit clipping.
+    # Use -1 for sign flip, 1 for no flip, and other values when scaling is required.
+    joint_directions: dict[str, float] = field(default_factory=dict)
 
 
 logger = logging.getLogger(__name__)
@@ -279,7 +253,6 @@ class SeeedB601FollowerBase(Robot):
         # Request and poll feedback from motorbridge
         for motor in self.motors.values():
             motor.request_feedback()
-
         try:
             self.bus.poll_feedback_once()
         except:
@@ -317,15 +290,19 @@ class SeeedB601FollowerBase(Robot):
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
-        # Apply joint limit clipping
+        # Apply per-joint direction/scale mapping before clipping.
         for motor_name, position in goal_pos.items():
+            direction = self.config.joint_directions.get(motor_name, 0.0)
+            position = position * direction
             # print(f"motor_name: {motor_name}, position: {position}")
             if motor_name in self.config.joint_limits:
                 min_limit, max_limit = self.config.joint_limits[motor_name]
                 clipped_position = max(min_limit, min(max_limit, position))
                 if clipped_position != position:
                     logger.debug(f"Clipped {motor_name} from {position:.2f} to {clipped_position:.2f}")
-                goal_pos[motor_name] = clipped_position
+                position = clipped_position
+
+            goal_pos[motor_name] = position
 
         # To tolerate 6-DOF leader arms that don't have a wrist_yaw joint, we can allow the follower to ignore missing wrist_yaw commands by treating them as 0.
         if 'wrist_yaw' not in goal_pos:

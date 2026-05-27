@@ -62,7 +62,7 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
         self._gripper_prev_target_pos = pos_target
 
         lpf_alpha = 0.3
-        target_vel_max = 2.0
+        target_vel_max = 3.0
         prev_filtered_vel = self._gripper_prev_filtered_target_vel
         if prev_filtered_vel is None:
             filtered_target_vel = target_vel
