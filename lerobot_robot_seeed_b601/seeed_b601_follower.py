@@ -207,10 +207,8 @@ class SeeedB601FollowerBase(Robot):
         self.bus.disable_all()
         num_retry = 9
         for motor_name, motor in self.motors.items():
-            target_mode = (
-                MotorBridgeMode.MIT
-                if motor_name == FOLLOWER_GRIPPER_MOTOR and self.motor_type == "rs"
-                else MotorBridgeMode.FORCE_POS
+            target_mode = MotorBridgeMode.MIT if self.motor_type == "rs" else (
+                MotorBridgeMode.FORCE_POS
                 if motor_name == FOLLOWER_GRIPPER_MOTOR
                 else MotorBridgeMode.POS_VEL
             )
@@ -354,8 +352,17 @@ class SeeedB601FollowerBase(Robot):
                         motor.send_force_pos(pos_rad, vel_rad, self.config.force_pos_torque_ration)
                         logger.debug(f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}")
                 else:
-                    motor.send_pos_vel(pos_rad, vel_rad)
-                    logger.debug(f"Sent POS_VEL command to {motor_name}: target={pos_rad:.2f},pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
+                    if self.motor_type == "rs":
+                        kp = getattr(self.config, "mit_kp", {}).get(motor_name, 0.0)
+                        kd = getattr(self.config, "mit_kd", {}).get(motor_name, 0.0)
+                        motor.send_mit(pos_rad, 0, kp, kd, 0)
+                        logger.debug(
+                            f"Sent MIT command to {motor_name}: "
+                            f"pos={position_degrees:.2f}°, kp={kp}, kd={kd}"
+                        )
+                    else:
+                        motor.send_pos_vel(pos_rad, vel_rad)
+                        logger.debug(f"Sent POS_VEL command to {motor_name}: target={pos_rad:.2f},pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
 
         # motorbridge sends packets mostly synchronously here over loop, 
         # so we don't need a bulk send command through ctypes.
