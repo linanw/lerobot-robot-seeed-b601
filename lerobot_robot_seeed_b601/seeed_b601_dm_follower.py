@@ -10,6 +10,7 @@ class SeeedB601DMFollower(SeeedB601FollowerBase):
 
     config_class = SeeedB601DMFollowerConfig
     name = "seeed_b601_dm_follower"
+    motor_type = "dm"
 
     motor_model_mapping = {
         "shoulder_pan":  "dm4340p",

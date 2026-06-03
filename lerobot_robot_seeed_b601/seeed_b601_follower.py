@@ -39,19 +39,9 @@ class SeeedB601FollowerConfigBase:
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     
-    # Motor configuration for B601 (6 DOF + Gripper)
+    # Motor configuration must be provided by concrete subclasses.
     # Maps motor names to (send_can_id, recv_can_id)
-    motor_can_ids: dict[str, tuple[int, int]] = field(
-        default_factory=lambda: {
-            "shoulder_pan":  (0x01, 0x11),
-            "shoulder_lift": (0x02, 0x12),
-            "elbow_flex":    (0x03, 0x13),
-            "wrist_flex":    (0x04, 0x14),
-            "wrist_yaw":     (0x05, 0x15),
-            "wrist_roll":    (0x06, 0x16),
-            "gripper":       (0x07, 0x17),
-        }
-    )
+    motor_can_ids: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     # Control parameters are defined by concrete subclasses so different motor families
     # can keep their own defaults.
@@ -61,19 +51,12 @@ class SeeedB601FollowerConfigBase:
     ## Default torque/current ration for gripper's FORCE_POS mode, in range [0,1].
     force_pos_torque_ration: float = 0.1
 
-    # Values for joint limits (Degrees)
-    # Note: These are soft limits. Physical verification is recommended.
-    joint_limits: dict[str, tuple[float, float]] = field(
-        default_factory=lambda: {
-            "shoulder_pan":  (-145.0, 145.0),
-            "shoulder_lift": (-170.0, 1.0),
-            "elbow_flex":    (-200.0, 1.0),
-            "wrist_flex":    (-80.0, 90.0),
-            "wrist_yaw":     (-90.0, 90.0),
-            "wrist_roll":    (-90.0, 90.0),
-            "gripper":       (-270.0, 0.0),
-        }
-    )
+    # Soft joint limits in degrees. Concrete subclasses should define defaults.
+    joint_limits: dict[str, tuple[float, float]] = field(default_factory=dict)
+
+    # Per-joint action direction/scale applied before joint-limit clipping.
+    # Use -1 for sign flip, 1 for no flip, and other values when scaling is required.
+    joint_directions: dict[str, float] = field(default_factory=dict)
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +71,8 @@ class SeeedB601FollowerBase(Robot):
     Base class for Seeed B601 Follower Arms (DM and RS variants).
     Uses CAN bus communication via motorbridge.
     """
+
+    motor_type: str = ""
 
     def __init__(self, config: SeeedB601FollowerConfigBase):
         super().__init__(config)
@@ -218,10 +203,11 @@ class SeeedB601FollowerBase(Robot):
 
     def configure(self) -> None:
         """Configure motors with appropriate settings."""
-        self.bus.enable_all()
+        # Keep torque off while switching modes, then enable after all motors are configured.
+        self.bus.disable_all()
         num_retry = 9
         for motor_name, motor in self.motors.items():
-            target_mode = (
+            target_mode = MotorBridgeMode.MIT if self.motor_type == "rs" else (
                 MotorBridgeMode.FORCE_POS
                 if motor_name == FOLLOWER_GRIPPER_MOTOR
                 else MotorBridgeMode.POS_VEL
@@ -235,6 +221,7 @@ class SeeedB601FollowerBase(Robot):
                         raise e
                     time.sleep(MEDIUM_TIMEOUT_SEC)
             logger.info(f"{motor_name} ensure mode {target_mode}")
+        self.bus.enable_all()
 
     def disable_torque(self) -> None:
         """Disable follower motor torque so the arm can be moved by hand during read-only debugging."""
@@ -243,6 +230,14 @@ class SeeedB601FollowerBase(Robot):
 
         self.bus.disable_all()
         logger.info(f"{self} torque disabled.")
+
+    def mit_output_torque_limit(
+        self,
+        motor: Any,
+        pos_target_rad: float,
+    ) -> float | None:
+        """Compute MIT torque command from target position and motor state."""
+        return 0.0
 
     def get_observation(self) -> RobotObservation:
         """Get current observation from robot."""
@@ -256,7 +251,6 @@ class SeeedB601FollowerBase(Robot):
         # Request and poll feedback from motorbridge
         for motor in self.motors.values():
             motor.request_feedback()
-
         try:
             self.bus.poll_feedback_once()
         except:
@@ -294,15 +288,19 @@ class SeeedB601FollowerBase(Robot):
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
-        # Apply joint limit clipping
+        # Apply per-joint direction/scale mapping before clipping.
         for motor_name, position in goal_pos.items():
+            direction = self.config.joint_directions.get(motor_name, 0.0)
+            position = position * direction
             # print(f"motor_name: {motor_name}, position: {position}")
             if motor_name in self.config.joint_limits:
                 min_limit, max_limit = self.config.joint_limits[motor_name]
                 clipped_position = max(min_limit, min(max_limit, position))
                 if clipped_position != position:
                     logger.debug(f"Clipped {motor_name} from {position:.2f} to {clipped_position:.2f}")
-                goal_pos[motor_name] = clipped_position
+                position = clipped_position
+
+            goal_pos[motor_name] = position
 
         # To tolerate 6-DOF leader arms that don't have a wrist_yaw joint, we can allow the follower to ignore missing wrist_yaw commands by treating them as 0.
         if 'wrist_yaw' not in goal_pos:
@@ -341,11 +339,30 @@ class SeeedB601FollowerBase(Robot):
             motor = self.motors.get(motor_name)
             if motor is not None:
                 if motor_name == FOLLOWER_GRIPPER_MOTOR:
-                    motor.send_force_pos(pos_rad, vel_rad, self.config.force_pos_torque_ration)
-                    logger.debug(f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}")
+                    if self.motor_type == "rs":
+                        tau_ff = self.mit_output_torque_limit(motor, pos_rad)
+                        if tau_ff is None:
+                            tau_ff = 0.0
+                        motor.send_mit(0, 0, 0, 1.5, tau_ff)
+                        logger.debug(
+                            f"Sent MIT command to {motor_name}: pos={position_degrees:.2f}°, "
+                            f"tau_ff={tau_ff:.2f}"
+                        )
+                    else:
+                        motor.send_force_pos(pos_rad, vel_rad, self.config.force_pos_torque_ration)
+                        logger.debug(f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}")
                 else:
-                    motor.send_pos_vel(pos_rad, vel_rad)
-                    logger.debug(f"Sent POS_VEL command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
+                    if self.motor_type == "rs":
+                        kp = getattr(self.config, "mit_kp", {}).get(motor_name, 0.0)
+                        kd = getattr(self.config, "mit_kd", {}).get(motor_name, 0.0)
+                        motor.send_mit(pos_rad, 0, kp, kd, 0)
+                        logger.debug(
+                            f"Sent MIT command to {motor_name}: "
+                            f"pos={position_degrees:.2f}°, kp={kp}, kd={kd}"
+                        )
+                    else:
+                        motor.send_pos_vel(pos_rad, vel_rad)
+                        logger.debug(f"Sent POS_VEL command to {motor_name}: target={pos_rad:.2f},pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
 
         # motorbridge sends packets mostly synchronously here over loop, 
         # so we don't need a bulk send command through ctypes.
@@ -360,7 +377,8 @@ class SeeedB601FollowerBase(Robot):
         for motor in self.motors.values():
             if self.config.disable_torque_on_disconnect:
                 motor.disable()
-            motor.clear_error()
+            if self.motor_type != "rs":
+                motor.clear_error()
             motor.close()
         
         self.bus.close()
