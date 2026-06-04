@@ -361,7 +361,7 @@ class SeeedB601FollowerBase(Robot):
                             f"pos={position_degrees:.2f}°, kp={kp}, kd={kd}"
                         )
                     else:
-                        motor.send_pos_vel(pos_rad, vel_rad)
+                        motor.send_pos_vel(pos_rad, 32)
                         logger.debug(f"Sent POS_VEL command to {motor_name}: target={pos_rad:.2f},pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
 
         # motorbridge sends packets mostly synchronously here over loop, 
