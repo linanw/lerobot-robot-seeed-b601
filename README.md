@@ -25,21 +25,7 @@ This repository provides the **Follower Arm (Robot)** integration for the **reBo
 2.  **Install the `motorbridge` Python package**:
 
     ```shell
-    # Go to https://github.com/tianrking/motorbridge/releases
-    # Download the wheel that matches your platform and Python version
-    # Example for Ubuntu x86_64 with Python 3.12:
-    pip install motorbridge-0.1.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
-
-    # TODO: switch to pip install from PyPI once published
-    ```
-
-    You can also install the optional `motor_cli` utility:
-
-    ```shell
-    wget https://github.com/tianrking/motorbridge/releases/download/v0.1.5/motor-cli-v0.1.5-linux-x86_64.tar.gz
-    tar zxvf motor-cli-v0.1.5-linux-x86_64.tar.gz
-    sudo cp motor-cli-v0.1.5-linux-x86_64/bin/motor_cli /usr/local/bin/
-    sudo chmod a+x /usr/local/bin/motor_cli
+    pip install motorbridge
     ```
 
 3.  **Install this package**:
