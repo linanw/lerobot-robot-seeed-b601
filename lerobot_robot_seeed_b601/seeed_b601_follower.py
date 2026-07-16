@@ -80,6 +80,7 @@ class SeeedB601FollowerBase(Robot):
         self.bus = None
         self.motors = {}
         self.motor_names = list(config.motor_can_ids.keys())
+        self._in_safe_zero = False
 
         # Initialize cameras
         self.cameras = make_cameras_from_configs(config.cameras)
@@ -239,6 +240,105 @@ class SeeedB601FollowerBase(Robot):
         """Compute MIT torque command from target position and motor state."""
         return 0.0
 
+    def safe_zero(self, step_interval_s: float = 0.02, exit_on_complete: bool = True) -> None:
+        """Move arm joints back to zero in a safer two-stage interpolation.
+
+        Stage 1: CAN ID 1/4/5/6 -> 0
+        Stage 2: CAN ID 2/3 -> 0
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        if self._in_safe_zero:
+            logger.warning("safe_zero skipped: already running.")
+            return
+
+        if step_interval_s < 0.0:
+            raise ValueError("step_interval_s must be >= 0")
+
+        self._in_safe_zero = True
+        try:
+            id_to_joint: dict[int, str] = {
+                send_id: motor_name
+                for motor_name, (send_id, _) in self.config.motor_can_ids.items()
+                if motor_name != FOLLOWER_GRIPPER_MOTOR
+            }
+
+            stage_1 = [id_to_joint[i] for i in (1, 4, 5, 6) if i in id_to_joint]
+            stage_2 = [id_to_joint[i] for i in (2, 3) if i in id_to_joint]
+            controlled_joints = stage_1 + [name for name in stage_2 if name not in stage_1]
+
+            if not controlled_joints:
+                logger.warning("safe_zero skipped: no arm joints mapped to CAN IDs 1-6.")
+                return
+
+            def _read_action_pos(joint_name: str) -> float:
+                motor = self.motors.get(joint_name)
+                if motor is None:
+                    raise RuntimeError(f"safe_zero failed: motor '{joint_name}' not found")
+
+                max_retry = 10
+                for attempt in range(1, max_retry + 1):
+                    try:
+                        motor.request_feedback()
+                        self.bus.poll_feedback_once()
+                    except Exception:
+                        logger.debug(
+                            "safe_zero feedback poll failed for %s (attempt %d/%d)",
+                            joint_name,
+                            attempt,
+                            max_retry,
+                        )
+
+                    state = motor.get_state()
+                    if state is not None:
+                        current_deg = math.degrees(state.pos)
+                        direction = self.config.joint_directions.get(joint_name, 1.0) or 1.0
+                        return current_deg / direction
+
+                    if attempt < max_retry:
+                        time.sleep(MEDIUM_TIMEOUT_SEC)
+
+                raise RuntimeError(
+                    f"safe_zero failed: unable to read state for '{joint_name}' after {max_retry} attempts"
+                )
+
+            def _frame_count(starts: dict[str, float]) -> int:
+                max_delta_deg = max((abs(v) for v in starts.values()), default=0.0)
+                return max(1, math.ceil(max_delta_deg * 1.0))
+
+            def _interp_to_zero(active_starts: dict[str, float], hold_joints: dict[str, float]) -> None:
+                if not active_starts:
+                    return
+                frames = _frame_count(active_starts)
+                for frame in range(1, frames + 1):
+                    ratio = frame / frames
+                    action: RobotAction = {}
+                    for joint, start in hold_joints.items():
+                        action[f"{joint}.pos"] = start
+                    for joint, start in active_starts.items():
+                        action[f"{joint}.pos"] = start * (1.0 - ratio)
+                    self.send_action(action)
+                    if step_interval_s > 0.0:
+                        time.sleep(step_interval_s)
+
+            stage_1_start = {joint: _read_action_pos(joint) for joint in stage_1}
+            stage_2_start = {joint: _read_action_pos(joint) for joint in stage_2}
+
+            logger.info("safe_zero stage1 start: joints=%s", stage_1)
+            _interp_to_zero(stage_1_start, stage_2_start)
+
+            logger.info("safe_zero stage2 start: joints=%s", stage_2)
+            _interp_to_zero(stage_2_start, {joint: 0.0 for joint in stage_1})
+            logger.info("safe_zero done.")
+
+            if exit_on_complete:
+                # Raise KeyboardInterrupt so upper-level control loops handle this
+                # the same way as Ctrl+C.
+                raise KeyboardInterrupt("safe_zero completed")
+        finally:
+            self._in_safe_zero = False
+
     def get_observation(self) -> RobotObservation:
         """Get current observation from robot."""
         start = time.perf_counter()
@@ -285,6 +385,26 @@ class SeeedB601FollowerBase(Robot):
         """Send action command to robot."""
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        if not self._in_safe_zero:
+            overheat_threshold_c = 130.0
+            for motor in self.motors.values():
+                motor.request_feedback()
+            try:
+                self.bus.poll_feedback_once()
+            except Exception:
+                logger.warning("Temperature check poll feedback failed.")
+
+            for motor in self.motors.values():
+                state = motor.get_state()
+                if state is None:
+                    continue
+                if state.t_mos > overheat_threshold_c:
+                    logger.error(
+                        "Overheat detected: t_mos > %.2fC. ",
+                        overheat_threshold_c,
+                    )
+                    raise KeyboardInterrupt("Overheat detected")
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
@@ -373,6 +493,12 @@ class SeeedB601FollowerBase(Robot):
         """Disconnect from robot."""
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        if not self._in_safe_zero:
+            try:
+                self.safe_zero(exit_on_complete=False)
+            except Exception:
+                logger.exception("safe_zero during disconnect failed.")
 
         for motor in self.motors.values():
             if self.config.disable_torque_on_disconnect:
