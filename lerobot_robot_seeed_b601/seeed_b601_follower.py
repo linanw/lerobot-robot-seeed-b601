@@ -81,6 +81,7 @@ class SeeedB601FollowerBase(Robot):
         self.motors = {}
         self.motor_names = list(config.motor_can_ids.keys())
         self._in_safe_zero = False
+        self._emergency_disable_requested = False
 
         # Initialize cameras
         self.cameras = make_cameras_from_configs(config.cameras)
@@ -232,6 +233,23 @@ class SeeedB601FollowerBase(Robot):
         self.bus.disable_all()
         logger.info(f"{self} torque disabled.")
 
+    def _read_motor_temperatures(self) -> dict[str, float]:
+        """Read per-motor MOS temperatures once and return available values."""
+        for motor in self.motors.values():
+            motor.request_feedback()
+        try:
+            self.bus.poll_feedback_once()
+        except Exception:
+            logger.warning("Temperature check poll feedback failed.")
+
+        temps: dict[str, float] = {}
+        for motor_name, motor in self.motors.items():
+            state = motor.get_state()
+            if state is not None:
+                temps[motor_name] = state.t_mos
+
+        return temps
+
     def mit_output_torque_limit(
         self,
         motor: Any,
@@ -307,11 +325,26 @@ class SeeedB601FollowerBase(Robot):
                 max_delta_deg = max((abs(v) for v in starts.values()), default=0.0)
                 return max(1, math.ceil(max_delta_deg * 1.0))
 
-            def _interp_to_zero(active_starts: dict[str, float], hold_joints: dict[str, float]) -> None:
+            def _interp_to_zero(active_starts: dict[str, float], hold_joints: dict[str, float]) -> bool:
                 if not active_starts:
-                    return
+                    return False
                 frames = _frame_count(active_starts)
+                emergency_disable_threshold_c = 135.0
                 for frame in range(1, frames + 1):
+                    temperatures = self._read_motor_temperatures()
+                    for motor_name, temp_c in temperatures.items():
+                        if temp_c > emergency_disable_threshold_c:
+                            logger.error(
+                                "Auto-disable on overtemperature during safe_zero: %s t_mos=%.2fC > %.2fC.",
+                                motor_name,
+                                temp_c,
+                                emergency_disable_threshold_c,
+                            )
+                            self._emergency_disable_requested = True
+                            self.disable_torque()
+                            logger.error("safe_zero aborted: emergency overtemperature.")
+                            return True
+
                     ratio = frame / frames
                     action: RobotAction = {}
                     for joint, start in hold_joints.items():
@@ -322,14 +355,17 @@ class SeeedB601FollowerBase(Robot):
                     if step_interval_s > 0.0:
                         time.sleep(step_interval_s)
 
+                return False
+
             stage_1_start = {joint: _read_action_pos(joint) for joint in stage_1}
             stage_2_start = {joint: _read_action_pos(joint) for joint in stage_2}
 
             logger.info("safe_zero stage1 start: joints=%s", stage_1)
-            _interp_to_zero(stage_1_start, stage_2_start)
-
+            if _interp_to_zero(stage_1_start, stage_2_start):
+                return
             logger.info("safe_zero stage2 start: joints=%s", stage_2)
-            _interp_to_zero(stage_2_start, {joint: 0.0 for joint in stage_1})
+            if _interp_to_zero(stage_2_start, {joint: 0.0 for joint in stage_1}):
+                return
             logger.info("safe_zero done.")
 
             if exit_on_complete:
@@ -387,21 +423,19 @@ class SeeedB601FollowerBase(Robot):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if not self._in_safe_zero:
-            overheat_threshold_c = 130.0
-            for motor in self.motors.values():
-                motor.request_feedback()
-            try:
-                self.bus.poll_feedback_once()
-            except Exception:
-                logger.warning("Temperature check poll feedback failed.")
-
-            for motor in self.motors.values():
-                state = motor.get_state()
-                if state is None:
-                    continue
-                if state.t_mos > overheat_threshold_c:
+            alarm_threshold_c = 80.0
+            overheat_threshold_c = 100.0
+            temperatures = self._read_motor_temperatures()
+            for motor_name, temp_c in temperatures.items():
+                if temp_c > alarm_threshold_c:
+                    print(
+                        f"[HIGH TEMP] {motor_name} t_mos={temp_c:.2f}C > {alarm_threshold_c:.2f}C"
+                    )
+                if temp_c > overheat_threshold_c:
                     logger.error(
-                        "Overheat detected: t_mos > %.2fC. ",
+                        "Overheat detected in send_action: %s t_mos=%.2fC > %.2fC.",
+                        motor_name,
+                        temp_c,
                         overheat_threshold_c,
                     )
                     raise KeyboardInterrupt("Overheat detected")
@@ -494,7 +528,7 @@ class SeeedB601FollowerBase(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if not self._in_safe_zero:
+        if not self._in_safe_zero and not self._emergency_disable_requested:
             try:
                 self.safe_zero(exit_on_complete=False)
             except Exception:
@@ -503,8 +537,7 @@ class SeeedB601FollowerBase(Robot):
         for motor in self.motors.values():
             if self.config.disable_torque_on_disconnect:
                 motor.disable()
-            if self.motor_type != "rs":
-                motor.clear_error()
+            motor.clear_error()
             motor.close()
         
         self.bus.close()
@@ -513,4 +546,5 @@ class SeeedB601FollowerBase(Robot):
         for cam in self.cameras.values():
             cam.disconnect()
 
+        self._emergency_disable_requested = False
         logger.info(f"{self} disconnected.")
