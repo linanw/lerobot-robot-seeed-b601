@@ -323,7 +323,7 @@ class SeeedB601FollowerBase(Robot):
 
             def _frame_count(starts: dict[str, float]) -> int:
                 max_delta_deg = max((abs(v) for v in starts.values()), default=0.0)
-                return max(1, math.ceil(max_delta_deg * 1.0))
+                return max(1, math.ceil(max_delta_deg * 2.0))
 
             def _interp_to_zero(active_starts: dict[str, float], hold_joints: dict[str, float]) -> bool:
                 if not active_starts:
@@ -367,7 +367,7 @@ class SeeedB601FollowerBase(Robot):
             if _interp_to_zero(stage_2_start, {joint: 0.0 for joint in stage_1}):
                 return
             logger.info("safe_zero done.")
-
+            time.sleep(2.0)
             if exit_on_complete:
                 # Raise KeyboardInterrupt so upper-level control loops handle this
                 # the same way as Ctrl+C.
