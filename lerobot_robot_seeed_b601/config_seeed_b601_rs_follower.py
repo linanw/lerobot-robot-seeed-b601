@@ -73,7 +73,12 @@ class SeeedB601RSFollowerConfig(RobotConfig, SeeedB601FollowerConfigBase):
     gripper_mit_kd: float = 0.05
 
     # Max absolute output torque allowed in MIT mode for the gripper
-    gripper_mit_torque_limit: float = 10.0
+    gripper_mit_torque_limit: float = 3.5
+
+    # Max absolute output torque for gripper when target velocity is near zero
+    # (used as grasp/hold state torque limit).
+    gripper_mit_hold_torque_limit: float = 1.0
+
 
     # The v_des parameter for the position-velocity control mode of the joints.
     pos_vel_velocity: float | list[float] = field(

@@ -53,6 +53,8 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
             self._gripper_prev_target_pos = None
         if not hasattr(self, "_gripper_prev_filtered_target_vel"):
             self._gripper_prev_filtered_target_vel = None
+        if not hasattr(self, "_gripper_prev_state_pos"):
+            self._gripper_prev_state_pos = None
 
         prev_target_pos = self._gripper_prev_target_pos
         if prev_target_pos is None:
@@ -73,6 +75,13 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
         target_vel = max(-target_vel_max, min(target_vel_max, filtered_target_vel))
         self._gripper_prev_filtered_target_vel = target_vel
 
+        prev_state_pos = self._gripper_prev_state_pos
+        if prev_state_pos is None:
+            estimated_state_vel = 0.0
+        else:
+            estimated_state_vel = (state.pos - prev_state_pos) / control_dt_s
+        self._gripper_prev_state_pos = state.pos
+
         kp = float(self.config.gripper_mit_kp)
         kd = float(self.config.gripper_mit_kd)
         impedance_torque = (
@@ -88,6 +97,11 @@ class SeeedB601RSFollower(SeeedB601FollowerBase):
             state.vel,
         )
 
-        max_torque = max(0.0, float(self.config.gripper_mit_torque_limit))
+        # Use dedicated grasp/hold torque limit when estimated motor speed is small.
+        max_torque = (
+            self.config.gripper_mit_torque_limit
+            if abs(estimated_state_vel) > 0.25
+            else self.config.gripper_mit_hold_torque_limit
+        )
         motor.request_feedback()
         return max(-max_torque, min(max_torque, impedance_torque))
