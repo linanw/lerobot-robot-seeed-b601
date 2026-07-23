@@ -580,10 +580,20 @@ class SeeedB601FollowerBase(Robot):
                 and previous_goal_pos is not None
                 and motor_name in previous_goal_pos
             ):
-                requested_velocity = (
-                    abs(position_degrees - previous_goal_pos[motor_name]) / control_dt_s
+                command_delta_deg = abs(
+                    position_degrees - previous_goal_pos[motor_name]
                 )
-                if self.config.adaptive_pos_vel_feedback and motor is not None:
+                requested_velocity = command_delta_deg / control_dt_s
+                if (
+                    self.config.adaptive_pos_vel_feedback
+                    and command_delta_deg > 1e-9
+                    and motor is not None
+                ):
+                    # Feedback compensation is useful while following a moving
+                    # trajectory. Once the target is held, feeding encoder
+                    # error back into vlim makes tiny load/encoder deviations
+                    # repeatedly accelerate the joint and can cause visible
+                    # pitch/yaw hunting around a stationary posture.
                     state = motor.get_state()
                     state_position = getattr(state, "pos", None)
                     if isinstance(state_position, int | float):

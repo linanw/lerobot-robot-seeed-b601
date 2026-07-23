@@ -135,6 +135,39 @@ def test_dm_arm_raises_vlim_only_for_joint_with_feedback_lag(
     assert wrist_vlim == pytest.approx(0.105)
 
 
+def test_dm_arm_does_not_chase_feedback_error_while_target_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_times = iter((40.0, 40.02))
+    monkeypatch.setattr(
+        "lerobot_robot_seeed_b601.seeed_b601_follower.time.perf_counter",
+        lambda: next(command_times),
+    )
+    robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
+    robot.config = SeeedB601DMFollowerConfig(port="/dev/null")
+    robot.bus = MagicMock()
+    robot.cameras = {}
+    robot.motor_names = list(robot.config.motor_can_ids)
+    robot.motors = {name: MagicMock() for name in robot.motor_names}
+    robot._in_safe_zero = True
+    robot._emergency_disable_requested = False
+    robot._last_goal_pos_deg = None
+    robot._last_action_time = None
+
+    robot.send_action({"wrist_flex.pos": 20.0})
+    # Simulate a small stationary-position error from load, encoder noise, or
+    # overshoot. The outer feedback loop must not turn it into repeated vlim
+    # acceleration when the commanded target itself has not moved.
+    robot.motors["wrist_flex"].get_state.return_value.pos = math.radians(19.9)
+    robot.send_action({"wrist_flex.pos": 20.0})
+
+    held_vlim = math.degrees(
+        robot.motors["wrist_flex"].send_pos_vel.call_args_list[1].args[1]
+    )
+    assert held_vlim == pytest.approx(robot.config.pos_vel_min_velocity)
+    robot.motors["wrist_flex"].get_state.assert_not_called()
+
+
 def test_dm_configure_applies_seeed_pos_vel_gains_without_storing() -> None:
     robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
     robot.config = SeeedB601DMFollowerConfig(port="/dev/null")
