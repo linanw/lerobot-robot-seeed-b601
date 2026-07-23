@@ -22,7 +22,7 @@ class SeeedB601FollowerConfigBase:
 
     # Communication port for CAN adapter (e.g., "can0" for SocketCAN, or "/dev/ttyACM0" for Damiao serial bridge)
     port: str
-    
+
     # CAN adapter type:
     #   "socketcan"  - SocketCAN based adapters (PCAN, slcan, embedded can controller, etc.)
     #   "damiao"     - Damiao dedicated serial bridge
@@ -38,7 +38,7 @@ class SeeedB601FollowerConfigBase:
     max_relative_target: float | dict[str, float] | None = None
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
-    
+
     # Motor configuration must be provided by concrete subclasses.
     # Maps motor names to (send_can_id, recv_can_id)
     motor_can_ids: dict[str, tuple[int, int]] = field(default_factory=dict)
@@ -47,6 +47,21 @@ class SeeedB601FollowerConfigBase:
     # can keep their own defaults.
     ## Default target velocity for joints running in POS_VEL mode, in degrees/s.
     pos_vel_velocity: float | list[float] = field(default_factory=list)
+
+    # Dynamically lower POS_VEL vlim to follow the commanded joint trajectory
+    # continuously. pos_vel_velocity remains the hard upper bound.
+    adaptive_pos_vel_velocity: bool = False
+    adaptive_pos_vel_feedback: bool = False
+    pos_vel_tracking_ratio: float = 1.25
+    pos_vel_min_velocity: float = 2.0
+
+    # Damiao POS_VEL loop gains. These are applied at connect time without
+    # storing them to motor flash, so power cycling restores persisted values.
+    configure_pos_vel_gains: bool = False
+    pos_vel_kp_asr: dict[str, float] = field(default_factory=dict)
+    pos_vel_ki_asr: dict[str, float] = field(default_factory=dict)
+    pos_vel_kp_apr: dict[str, float] = field(default_factory=dict)
+    pos_vel_ki_apr: dict[str, float] = field(default_factory=dict)
 
     ## Default torque/current ration for gripper's FORCE_POS mode, in range [0,1].
     force_pos_torque_ration: float = 0.1
@@ -66,6 +81,7 @@ FOLLOWER_GRIPPER_MOTOR = "gripper"
 LONG_TIMEOUT_SEC = 0.1
 MEDIUM_TIMEOUT_SEC = 0.01
 
+
 class SeeedB601FollowerBase(Robot):
     """
     Base class for Seeed B601 Follower Arms (DM and RS variants).
@@ -82,6 +98,8 @@ class SeeedB601FollowerBase(Robot):
         self.motor_names = list(config.motor_can_ids.keys())
         self._in_safe_zero = False
         self._emergency_disable_requested = False
+        self._last_goal_pos_deg: dict[str, float] | None = None
+        self._last_action_time: float | None = None
 
         # Initialize cameras
         self.cameras = make_cameras_from_configs(config.cameras)
@@ -117,7 +135,9 @@ class SeeedB601FollowerBase(Robot):
     @property
     def is_connected(self) -> bool:
         """Check if robot is connected."""
-        return self.bus is not None and all(cam.is_connected for cam in self.cameras.values())
+        return self.bus is not None and all(
+            cam.is_connected for cam in self.cameras.values()
+        )
 
     def _add_motors_to_bus(self):
         """Must be implemented by subclasses to add specific motor types to self.bus."""
@@ -128,7 +148,9 @@ class SeeedB601FollowerBase(Robot):
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
-        logger.info(f"Connecting arm on {self.config.port} (adapter={self.config.can_adapter})...")
+        logger.info(
+            f"Connecting arm on {self.config.port} (adapter={self.config.can_adapter})..."
+        )
         if self.config.can_adapter == "damiao":
             self.bus = MotorBridgeController.from_dm_serial(
                 serial_port=self.config.port,
@@ -141,7 +163,7 @@ class SeeedB601FollowerBase(Robot):
         else:
             # Default: socketcan (PCAN, slcan, etc.)
             self.bus = MotorBridgeController(channel=self.config.port)
-        
+
         self._add_motors_to_bus()
 
         if not self.is_calibrated and calibrate:
@@ -173,7 +195,7 @@ class SeeedB601FollowerBase(Robot):
                 return
 
         logger.info(f"\nRunning calibration for {self}")
-        
+
         self.bus.disable_all()
 
         print(
@@ -186,7 +208,7 @@ class SeeedB601FollowerBase(Robot):
         for motor in self.motors.values():
             motor.set_zero_position()
             time.sleep(LONG_TIMEOUT_SEC)
-        
+
         logger.info("Arm zero position set.")
 
         logger.info("Setting range: -90° to +90° by default for all joints")
@@ -209,11 +231,41 @@ class SeeedB601FollowerBase(Robot):
         self.bus.disable_all()
         num_retry = 9
         for motor_name, motor in self.motors.items():
-            target_mode = MotorBridgeMode.MIT if self.motor_type == "rs" else (
-                MotorBridgeMode.FORCE_POS
-                if motor_name == FOLLOWER_GRIPPER_MOTOR
-                else MotorBridgeMode.POS_VEL
+            target_mode = (
+                MotorBridgeMode.MIT
+                if self.motor_type == "rs"
+                else (
+                    MotorBridgeMode.FORCE_POS
+                    if motor_name == FOLLOWER_GRIPPER_MOTOR
+                    else MotorBridgeMode.POS_VEL
+                )
             )
+            if (
+                self.motor_type == "dm"
+                and motor_name != FOLLOWER_GRIPPER_MOTOR
+                and self.config.configure_pos_vel_gains
+            ):
+                gains = (
+                    (25, "KP_ASR", self.config.pos_vel_kp_asr),
+                    (26, "KI_ASR", self.config.pos_vel_ki_asr),
+                    (27, "KP_APR", self.config.pos_vel_kp_apr),
+                    (28, "KI_APR", self.config.pos_vel_ki_apr),
+                )
+                for register_id, register_name, values in gains:
+                    if motor_name not in values:
+                        raise ValueError(
+                            f"Missing Damiao POS_VEL {register_name} value for {motor_name}"
+                        )
+                    motor.write_register_f32(register_id, values[motor_name])
+                time.sleep(MEDIUM_TIMEOUT_SEC * 2)
+                logger.info(
+                    "%s POS_VEL gains: KP_ASR=%g KI_ASR=%g KP_APR=%g KI_APR=%g",
+                    motor_name,
+                    self.config.pos_vel_kp_asr[motor_name],
+                    self.config.pos_vel_ki_asr[motor_name],
+                    self.config.pos_vel_kp_apr[motor_name],
+                    self.config.pos_vel_ki_apr[motor_name],
+                )
             for _ in range(num_retry + 1):
                 try:
                     motor.ensure_mode(target_mode)
@@ -258,7 +310,9 @@ class SeeedB601FollowerBase(Robot):
         """Compute MIT torque command from target position and motor state."""
         return 0.0
 
-    def safe_zero(self, step_interval_s: float = 0.02, exit_on_complete: bool = True) -> None:
+    def safe_zero(
+        self, step_interval_s: float = 0.02, exit_on_complete: bool = True
+    ) -> None:
         """Move arm joints back to zero in a safer two-stage interpolation.
 
         Stage 1: CAN ID 1/4/5/6 -> 0
@@ -284,16 +338,22 @@ class SeeedB601FollowerBase(Robot):
 
             stage_1 = [id_to_joint[i] for i in (1, 4, 5, 6) if i in id_to_joint]
             stage_2 = [id_to_joint[i] for i in (2, 3) if i in id_to_joint]
-            controlled_joints = stage_1 + [name for name in stage_2 if name not in stage_1]
+            controlled_joints = stage_1 + [
+                name for name in stage_2 if name not in stage_1
+            ]
 
             if not controlled_joints:
-                logger.warning("safe_zero skipped: no arm joints mapped to CAN IDs 1-6.")
+                logger.warning(
+                    "safe_zero skipped: no arm joints mapped to CAN IDs 1-6."
+                )
                 return
 
             def _read_action_pos(joint_name: str) -> float:
                 motor = self.motors.get(joint_name)
                 if motor is None:
-                    raise RuntimeError(f"safe_zero failed: motor '{joint_name}' not found")
+                    raise RuntimeError(
+                        f"safe_zero failed: motor '{joint_name}' not found"
+                    )
 
                 max_retry = 10
                 for attempt in range(1, max_retry + 1):
@@ -311,7 +371,9 @@ class SeeedB601FollowerBase(Robot):
                     state = motor.get_state()
                     if state is not None:
                         current_deg = math.degrees(state.pos)
-                        direction = self.config.joint_directions.get(joint_name, 1.0) or 1.0
+                        direction = (
+                            self.config.joint_directions.get(joint_name, 1.0) or 1.0
+                        )
                         return current_deg / direction
 
                     if attempt < max_retry:
@@ -325,7 +387,9 @@ class SeeedB601FollowerBase(Robot):
                 max_delta_deg = max((abs(v) for v in starts.values()), default=0.0)
                 return max(1, math.ceil(max_delta_deg * 2.0))
 
-            def _interp_to_zero(active_starts: dict[str, float], hold_joints: dict[str, float]) -> bool:
+            def _interp_to_zero(
+                active_starts: dict[str, float], hold_joints: dict[str, float]
+            ) -> bool:
                 if not active_starts:
                     return False
                 frames = _frame_count(active_starts)
@@ -342,7 +406,9 @@ class SeeedB601FollowerBase(Robot):
                             )
                             self._emergency_disable_requested = True
                             self.disable_torque()
-                            logger.error("safe_zero aborted: emergency overtemperature.")
+                            logger.error(
+                                "safe_zero aborted: emergency overtemperature."
+                            )
                             return True
 
                     ratio = frame / frames
@@ -389,8 +455,8 @@ class SeeedB601FollowerBase(Robot):
             motor.request_feedback()
         try:
             self.bus.poll_feedback_once()
-        except:
-            logger.warning(f"can bus poll feedback failed.")
+        except Exception:
+            logger.warning("CAN bus poll feedback failed.")
 
         for motor_name, motor in self.motors.items():
             state = motor.get_state()
@@ -414,10 +480,7 @@ class SeeedB601FollowerBase(Robot):
 
         return obs_dict
 
-    def send_action(
-        self,
-        action: RobotAction
-    ) -> RobotAction:
+    def send_action(self, action: RobotAction) -> RobotAction:
         """Send action command to robot."""
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
@@ -440,7 +503,11 @@ class SeeedB601FollowerBase(Robot):
                     )
                     raise KeyboardInterrupt("Overheat detected")
 
-        goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+        goal_pos = {
+            key.removesuffix(".pos"): val
+            for key, val in action.items()
+            if key.endswith(".pos")
+        }
 
         # Apply per-joint direction/scale mapping before clipping.
         for motor_name, position in goal_pos.items():
@@ -451,14 +518,16 @@ class SeeedB601FollowerBase(Robot):
                 min_limit, max_limit = self.config.joint_limits[motor_name]
                 clipped_position = max(min_limit, min(max_limit, position))
                 if clipped_position != position:
-                    logger.debug(f"Clipped {motor_name} from {position:.2f} to {clipped_position:.2f}")
+                    logger.debug(
+                        f"Clipped {motor_name} from {position:.2f} to {clipped_position:.2f}"
+                    )
                 position = clipped_position
 
             goal_pos[motor_name] = position
 
         # To tolerate 6-DOF leader arms that don't have a wrist_yaw joint, we can allow the follower to ignore missing wrist_yaw commands by treating them as 0.
-        if 'wrist_yaw' not in goal_pos:
-            goal_pos['wrist_yaw'] = 0.0
+        if "wrist_yaw" not in goal_pos:
+            goal_pos["wrist_yaw"] = 0.0
 
         # Safety: Cap relative target
         if self.config.max_relative_target is not None:
@@ -470,16 +539,30 @@ class SeeedB601FollowerBase(Robot):
                     present_pos[motor_name] = math.degrees(state.pos)
                 else:
                     present_pos[motor_name] = 0.0
-            
-            goal_present_pos = {key: (g_pos, present_pos.get(key, g_pos)) for key, g_pos in goal_pos.items()}
-            goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+
+            goal_present_pos = {
+                key: (g_pos, present_pos.get(key, g_pos))
+                for key, g_pos in goal_pos.items()
+            }
+            goal_pos = ensure_safe_goal_position(
+                goal_present_pos, self.config.max_relative_target
+            )
+
+        command_time = time.perf_counter()
+        last_action_time = getattr(self, "_last_action_time", None)
+        control_dt_s = (
+            None
+            if last_action_time is None
+            else min(max(command_time - last_action_time, 1e-3), 0.1)
+        )
+        previous_goal_pos = getattr(self, "_last_goal_pos_deg", None)
 
         # Prepare and send commands
         for motor_name, position_degrees in goal_pos.items():
             try:
                 idx = self.motor_names.index(motor_name)
             except ValueError:
-                idx = 0 # Fallback
+                idx = 0  # Fallback
 
             # Convert target position from degrees to radians for motorbridge
             pos_rad = math.radians(position_degrees)
@@ -488,9 +571,37 @@ class SeeedB601FollowerBase(Robot):
                 if isinstance(self.config.pos_vel_velocity, list)
                 else self.config.pos_vel_velocity
             )
+            motor = self.motors.get(motor_name)
+            if (
+                self.motor_type == "dm"
+                and motor_name != FOLLOWER_GRIPPER_MOTOR
+                and self.config.adaptive_pos_vel_velocity
+                and control_dt_s is not None
+                and previous_goal_pos is not None
+                and motor_name in previous_goal_pos
+            ):
+                requested_velocity = (
+                    abs(position_degrees - previous_goal_pos[motor_name]) / control_dt_s
+                )
+                if self.config.adaptive_pos_vel_feedback and motor is not None:
+                    state = motor.get_state()
+                    state_position = getattr(state, "pos", None)
+                    if isinstance(state_position, int | float):
+                        tracking_velocity = (
+                            abs(position_degrees - math.degrees(state_position))
+                            / control_dt_s
+                        )
+                        requested_velocity = max(requested_velocity, tracking_velocity)
+                min_velocity = min(vel_deg_s, self.config.pos_vel_min_velocity)
+                vel_deg_s = min(
+                    vel_deg_s,
+                    max(
+                        min_velocity,
+                        requested_velocity * self.config.pos_vel_tracking_ratio,
+                    ),
+                )
             vel_rad = math.radians(vel_deg_s)
 
-            motor = self.motors.get(motor_name)
             if motor is not None:
                 if motor_name == FOLLOWER_GRIPPER_MOTOR:
                     if self.motor_type == "rs":
@@ -503,8 +614,12 @@ class SeeedB601FollowerBase(Robot):
                             f"tau_ff={tau_ff:.2f}"
                         )
                     else:
-                        motor.send_force_pos(pos_rad, vel_rad, self.config.force_pos_torque_ration)
-                        logger.debug(f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}")
+                        motor.send_force_pos(
+                            pos_rad, vel_rad, self.config.force_pos_torque_ration
+                        )
+                        logger.debug(
+                            f"Sent FORCE_POS command to {motor_name}: pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s, ratio={0.1}"
+                        )
                 else:
                     if self.motor_type == "rs":
                         kp = getattr(self.config, "mit_kp", {}).get(motor_name, 0.0)
@@ -515,10 +630,16 @@ class SeeedB601FollowerBase(Robot):
                             f"pos={position_degrees:.2f}°, kp={kp}, kd={kd}"
                         )
                     else:
-                        motor.send_pos_vel(pos_rad, 32)
-                        logger.debug(f"Sent POS_VEL command to {motor_name}: target={pos_rad:.2f},pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
+                        motor.send_pos_vel(pos_rad, vel_rad)
+                        logger.debug(
+                            f"Sent POS_VEL command to {motor_name}: target={pos_rad:.2f}, "
+                            f"pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s"
+                        )
 
-        # motorbridge sends packets mostly synchronously here over loop, 
+        self._last_goal_pos_deg = dict(goal_pos)
+        self._last_action_time = command_time
+
+        # motorbridge sends packets mostly synchronously here over loop,
         # so we don't need a bulk send command through ctypes.
 
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
@@ -539,7 +660,7 @@ class SeeedB601FollowerBase(Robot):
                 motor.disable()
             motor.clear_error()
             motor.close()
-        
+
         self.bus.close()
         self.bus = None
 
