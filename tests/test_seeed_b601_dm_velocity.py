@@ -9,6 +9,16 @@ from lerobot_robot_seeed_b601.config_seeed_b601_dm_follower import (
 from lerobot_robot_seeed_b601.seeed_b601_dm_follower import SeeedB601DMFollower
 
 
+SCRIPT_INITIAL_GAINS = {
+    "shoulder_pan": 0.0157,
+    "shoulder_lift": 0.0197,
+    "elbow_flex": 0.0197,
+    "wrist_flex": 0.012,
+    "wrist_yaw": 0.004,
+    "wrist_roll": 0.004,
+}
+
+
 def test_dm_arm_uses_configured_pos_vel_velocity_on_first_command() -> None:
     robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
     robot.config = SeeedB601DMFollowerConfig(
@@ -194,3 +204,221 @@ def test_dm_configure_applies_seeed_pos_vel_gains_without_storing() -> None:
     robot.motors["gripper"].write_register_f32.assert_not_called()
     for motor in robot.motors.values():
         motor.store_parameters.assert_not_called()
+
+
+def test_dm_configure_applies_all_initial_arm_kp_asr_values() -> None:
+    robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
+    robot.config = SeeedB601DMFollowerConfig(
+        port="/dev/null",
+        arm_hold_kp_asr_initial=SCRIPT_INITIAL_GAINS,
+    )
+    robot.bus = MagicMock()
+    robot.motor_names = list(robot.config.motor_can_ids)
+    robot.motors = {name: MagicMock() for name in robot.motor_names}
+
+    robot.configure()
+
+    for motor_name, initial_gain in SCRIPT_INITIAL_GAINS.items():
+        assert robot.motors[motor_name].write_register_f32.call_args_list[0] == call(
+            25, initial_gain
+        )
+        assert robot._runtime_arm_hold_kp_asr[motor_name] == pytest.approx(
+            initial_gain
+        )
+
+
+def test_arm_hold_stiffness_adjustment_updates_only_joints_2_3_4() -> None:
+    robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
+    robot.config = SeeedB601DMFollowerConfig(port="/dev/null")
+    robot.bus = MagicMock()
+    robot.cameras = {}
+    robot.motor_names = list(robot.config.motor_can_ids)
+    robot.motors = {name: MagicMock() for name in robot.motor_names}
+    robot._runtime_arm_hold_velocity_deg_s = robot.config.arm_hold_velocity_min
+    robot._runtime_arm_hold_kp_asr = dict(robot.config.arm_hold_kp_asr_initial)
+    robot._runtime_arm_kp_asr_extra = {
+        "shoulder_lift": 0.0,
+        "elbow_flex": 0.0,
+        "wrist_flex": 0.0,
+    }
+    arm_names = [name for name in robot.motor_names if name != "gripper"]
+    for name in arm_names:
+        base = robot.config.arm_hold_kp_asr_initial[name]
+        adjusted = base + 0.0004 if name in robot._runtime_arm_kp_asr_extra else base
+        robot.motors[name].get_register_f32.side_effect = [
+            adjusted,
+            base,
+        ]
+
+    velocity, gains = robot.adjust_arm_hold_stiffness(1)
+    assert velocity == pytest.approx(0.52)
+    assert gains["shoulder_pan"] == pytest.approx(0.0125)
+    assert gains["shoulder_lift"] == pytest.approx(0.0129)
+    assert gains["elbow_flex"] == pytest.approx(0.0129)
+    assert gains["wrist_flex"] == pytest.approx(0.0012)
+    assert gains["wrist_yaw"] == pytest.approx(0.0008)
+
+    velocity, gains = robot.adjust_arm_hold_stiffness(-2)
+    assert velocity == pytest.approx(0.02)
+    assert gains == pytest.approx(robot.config.arm_hold_kp_asr_initial)
+
+    for name in arm_names:
+        base = robot.config.arm_hold_kp_asr_initial[name]
+        adjusted = base + 0.0004 if name in robot._runtime_arm_kp_asr_extra else base
+        assert robot.motors[name].write_register_f32.call_args_list == [
+            call(25, pytest.approx(adjusted)),
+            call(25, pytest.approx(base)),
+        ]
+        robot.motors[name].store_parameters.assert_not_called()
+    robot.motors["gripper"].write_register_f32.assert_not_called()
+
+
+def test_arm_hold_stiffness_adjustment_clamps_to_safe_range() -> None:
+    robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
+    robot.config = SeeedB601DMFollowerConfig(
+        port="/dev/null",
+        arm_hold_kp_asr_initial=SCRIPT_INITIAL_GAINS,
+    )
+    robot.bus = MagicMock()
+    robot.cameras = {}
+    robot.motor_names = list(robot.config.motor_can_ids)
+    robot.motors = {name: MagicMock() for name in robot.motor_names}
+    robot._runtime_arm_hold_velocity_deg_s = robot.config.arm_hold_velocity_min
+    robot._runtime_arm_hold_kp_asr = dict(robot.config.arm_hold_kp_asr_initial)
+    robot._runtime_arm_kp_asr_extra = {
+        "shoulder_lift": 0.0,
+        "elbow_flex": 0.0,
+        "wrist_flex": 0.0,
+    }
+    arm_names = [name for name in robot.motor_names if name != "gripper"]
+    for name in arm_names:
+        base = robot.config.arm_hold_kp_asr_initial[name]
+        maximum = base + (0.004 if name in robot._runtime_arm_kp_asr_extra else 0.0)
+        one_step_down = base + (
+            0.0036 if name in robot._runtime_arm_kp_asr_extra else 0.0
+        )
+        robot.motors[name].get_register_f32.side_effect = [
+            maximum,
+            one_step_down,
+            base,
+        ]
+
+    velocity, gains = robot.adjust_arm_hold_stiffness(100)
+    assert velocity == 5.0
+    assert gains["shoulder_pan"] == pytest.approx(0.0157)
+    assert gains["shoulder_lift"] == pytest.approx(0.0237)
+    assert gains["elbow_flex"] == pytest.approx(0.0237)
+    assert gains["wrist_flex"] == pytest.approx(0.016)
+    assert gains["wrist_yaw"] == pytest.approx(0.004)
+
+    velocity, gains = robot.adjust_arm_hold_stiffness(-1)
+    assert velocity == 4.5
+    assert gains["shoulder_pan"] == pytest.approx(0.0157)
+    assert gains["shoulder_lift"] == pytest.approx(0.0233)
+    assert gains["elbow_flex"] == pytest.approx(0.0233)
+    assert gains["wrist_flex"] == pytest.approx(0.0156)
+    assert gains["wrist_yaw"] == pytest.approx(0.004)
+
+    velocity, gains = robot.adjust_arm_hold_stiffness(-100)
+    assert velocity == 0.02
+    assert gains == pytest.approx(SCRIPT_INITIAL_GAINS)
+    assert robot.motors["wrist_flex"].write_register_f32.call_args_list == [
+        call(25, pytest.approx(0.016)),
+        call(25, pytest.approx(0.0156)),
+        call(25, pytest.approx(0.012)),
+    ]
+    assert robot.motors["shoulder_lift"].write_register_f32.call_args_list == [
+        call(25, pytest.approx(0.0237)),
+        call(25, pytest.approx(0.0233)),
+        call(25, pytest.approx(0.0197)),
+    ]
+
+
+def test_arm_kp_asr_switches_once_per_motion_hold_transition() -> None:
+    robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
+    robot.config = SeeedB601DMFollowerConfig(
+        port="/dev/null",
+        arm_hold_kp_asr_initial=SCRIPT_INITIAL_GAINS,
+    )
+    robot.bus = MagicMock()
+    robot.cameras = {}
+    robot.motor_names = list(robot.config.motor_can_ids)
+    robot.motors = {name: MagicMock() for name in robot.motor_names}
+    robot._runtime_arm_hold_kp_asr = dict(SCRIPT_INITIAL_GAINS)
+    robot._arm_kp_asr_mode = "hold"
+    arm_names = [name for name in robot.motor_names if name != "gripper"]
+
+    robot.set_arm_motion_active(True)
+    robot.set_arm_motion_active(True)
+    for name in arm_names:
+        robot.motors[name].write_register_f32.assert_called_once_with(
+            25,
+            robot.config.arm_motion_kp_asr[name],
+        )
+
+    robot.set_arm_motion_active(False)
+    for name in arm_names:
+        assert robot.motors[name].write_register_f32.call_args_list[-1] == call(
+            25,
+            SCRIPT_INITIAL_GAINS[name],
+        )
+        assert robot.motors[name].write_register_f32.call_count == 2
+    robot.motors["gripper"].write_register_f32.assert_not_called()
+
+
+def test_home_updates_pending_hold_gains_without_overwriting_motion_gains() -> None:
+    robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
+    robot.config = SeeedB601DMFollowerConfig(
+        port="/dev/null",
+        arm_hold_kp_asr_initial=SCRIPT_INITIAL_GAINS,
+    )
+    robot.bus = MagicMock()
+    robot.cameras = {}
+    robot.motor_names = list(robot.config.motor_can_ids)
+    robot.motors = {name: MagicMock() for name in robot.motor_names}
+    robot._runtime_arm_hold_velocity_deg_s = robot.config.arm_hold_velocity_min
+    robot._runtime_arm_hold_kp_asr = dict(SCRIPT_INITIAL_GAINS)
+    robot._runtime_arm_kp_asr_extra = {
+        "shoulder_lift": 0.0,
+        "elbow_flex": 0.0,
+        "wrist_flex": 0.0,
+    }
+    robot._arm_kp_asr_mode = "motion"
+
+    _, hold_gains = robot.adjust_arm_hold_stiffness(1)
+
+    assert hold_gains["shoulder_lift"] == pytest.approx(0.0201)
+    assert hold_gains["wrist_flex"] == pytest.approx(0.0124)
+    for motor in robot.motors.values():
+        motor.write_register_f32.assert_not_called()
+
+
+def test_all_stationary_arm_targets_use_adjustable_hold_vlim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_times = iter((50.0, 50.02))
+    monkeypatch.setattr(
+        "lerobot_robot_seeed_b601.seeed_b601_follower.time.perf_counter",
+        lambda: next(command_times),
+    )
+    robot = SeeedB601DMFollower.__new__(SeeedB601DMFollower)
+    robot.config = SeeedB601DMFollowerConfig(port="/dev/null")
+    robot.bus = MagicMock()
+    robot.cameras = {}
+    robot.motor_names = list(robot.config.motor_can_ids)
+    robot.motors = {name: MagicMock() for name in robot.motor_names}
+    robot._in_safe_zero = True
+    robot._emergency_disable_requested = False
+    robot._last_goal_pos_deg = None
+    robot._last_action_time = None
+    robot._runtime_arm_hold_velocity_deg_s = 2.5
+
+    action = {"shoulder_pan.pos": 5.0, "wrist_yaw.pos": 10.0}
+    robot.send_action(action)
+    robot.send_action(action)
+
+    for name in ("shoulder_pan", "wrist_yaw"):
+        held_vlim = math.degrees(
+            robot.motors[name].send_pos_vel.call_args_list[1].args[1]
+        )
+        assert held_vlim == pytest.approx(2.5)

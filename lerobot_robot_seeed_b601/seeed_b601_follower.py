@@ -78,6 +78,9 @@ logger = logging.getLogger(__name__)
 
 
 FOLLOWER_GRIPPER_MOTOR = "gripper"
+WRIST_FLEX_MOTOR = "wrist_flex"
+EXTRA_STIFFNESS_MOTORS = ("shoulder_lift", "elbow_flex", WRIST_FLEX_MOTOR)
+DAMIAO_KP_ASR_REGISTER = 25
 LONG_TIMEOUT_SEC = 0.1
 MEDIUM_TIMEOUT_SEC = 0.01
 
@@ -100,6 +103,20 @@ class SeeedB601FollowerBase(Robot):
         self._emergency_disable_requested = False
         self._last_goal_pos_deg: dict[str, float] | None = None
         self._last_action_time: float | None = None
+        self._runtime_arm_hold_velocity_deg_s = (
+            config.arm_hold_velocity_min
+            if self.motor_type == "dm"
+            else config.pos_vel_min_velocity
+        )
+        self._runtime_arm_hold_kp_asr = (
+            dict(config.arm_hold_kp_asr_initial)
+            if self.motor_type == "dm"
+            else dict(config.pos_vel_kp_asr)
+        )
+        self._runtime_arm_kp_asr_extra = {
+            motor_name: 0.0 for motor_name in EXTRA_STIFFNESS_MOTORS
+        }
+        self._arm_kp_asr_mode = "hold"
 
         # Initialize cameras
         self.cameras = make_cameras_from_configs(config.cameras)
@@ -131,6 +148,14 @@ class SeeedB601FollowerBase(Robot):
     def action_features(self) -> dict[str, type]:
         """Action features."""
         return self._motors_ft
+
+    @property
+    def limit_cartesian_jog_acceleration(self) -> bool:
+        return bool(self.config.limit_cartesian_jog_acceleration)
+
+    @property
+    def cartesian_jog_accel_m_s2(self) -> float:
+        return float(self.config.cartesian_jog_accel_m_s2)
 
     @property
     def is_connected(self) -> bool:
@@ -229,6 +254,38 @@ class SeeedB601FollowerBase(Robot):
         """Configure motors with appropriate settings."""
         # Keep torque off while switching modes, then enable after all motors are configured.
         self.bus.disable_all()
+        if self.motor_type == "dm":
+            arm_motor_names = {
+                name for name in self.motor_names if name != FOLLOWER_GRIPPER_MOTOR
+            }
+            for field_name, gains in (
+                ("arm_hold_kp_asr_initial", self.config.arm_hold_kp_asr_initial),
+                ("arm_motion_kp_asr", self.config.arm_motion_kp_asr),
+            ):
+                if set(gains) != arm_motor_names:
+                    raise ValueError(
+                        f"{field_name} must contain exactly all six arm motors"
+                    )
+                if any(value <= 0 for value in gains.values()):
+                    raise ValueError(f"{field_name} values must be greater than 0")
+            if set(self.config.arm_hold_kp_asr_extra_max) != set(
+                EXTRA_STIFFNESS_MOTORS
+            ):
+                raise ValueError(
+                    "arm_hold_kp_asr_extra_max must contain exactly joints 2, 3, and 4"
+                )
+            if any(
+                value < 0 for value in self.config.arm_hold_kp_asr_extra_max.values()
+            ):
+                raise ValueError("arm_hold_kp_asr_extra_max values must not be negative")
+            self._runtime_arm_hold_velocity_deg_s = self.config.arm_hold_velocity_min
+            self._runtime_arm_hold_kp_asr = dict(
+                self.config.arm_hold_kp_asr_initial
+            )
+            self._runtime_arm_kp_asr_extra = {
+                motor_name: 0.0 for motor_name in EXTRA_STIFFNESS_MOTORS
+            }
+            self._arm_kp_asr_mode = "hold"
         num_retry = 9
         for motor_name, motor in self.motors.items():
             target_mode = (
@@ -256,12 +313,17 @@ class SeeedB601FollowerBase(Robot):
                         raise ValueError(
                             f"Missing Damiao POS_VEL {register_name} value for {motor_name}"
                         )
-                    motor.write_register_f32(register_id, values[motor_name])
+                    value = (
+                        self._configured_kp_asr(motor_name)
+                        if register_id == DAMIAO_KP_ASR_REGISTER
+                        else values[motor_name]
+                    )
+                    motor.write_register_f32(register_id, value)
                 time.sleep(MEDIUM_TIMEOUT_SEC * 2)
                 logger.info(
                     "%s POS_VEL gains: KP_ASR=%g KI_ASR=%g KP_APR=%g KI_APR=%g",
                     motor_name,
-                    self.config.pos_vel_kp_asr[motor_name],
+                    self._configured_kp_asr(motor_name),
                     self.config.pos_vel_ki_asr[motor_name],
                     self.config.pos_vel_kp_apr[motor_name],
                     self.config.pos_vel_ki_apr[motor_name],
@@ -277,6 +339,11 @@ class SeeedB601FollowerBase(Robot):
             logger.info(f"{motor_name} ensure mode {target_mode}")
         self.bus.enable_all()
 
+    def _configured_kp_asr(self, motor_name: str) -> float:
+        if self.motor_type == "dm":
+            return self.config.arm_hold_kp_asr_initial[motor_name]
+        return self.config.pos_vel_kp_asr[motor_name]
+
     def disable_torque(self) -> None:
         """Disable follower motor torque so the arm can be moved by hand during read-only debugging."""
         if not self.is_connected:
@@ -284,6 +351,122 @@ class SeeedB601FollowerBase(Robot):
 
         self.bus.disable_all()
         logger.info(f"{self} torque disabled.")
+
+    def adjust_arm_hold_stiffness(
+        self,
+        steps: int,
+    ) -> tuple[float, dict[str, float]]:
+        """Adjust all arm joints' hold vlim and speed-loop gain in RAM."""
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        if self.motor_type != "dm":
+            raise RuntimeError(
+                "Runtime arm hold-stiffness adjustment requires a B601-DM follower."
+            )
+        if not isinstance(steps, int):
+            raise TypeError(f"steps must be int, got {type(steps).__name__}")
+
+        current_velocity = getattr(
+            self,
+            "_runtime_arm_hold_velocity_deg_s",
+            self.config.arm_hold_velocity_min,
+        )
+        updated_velocity = max(
+            self.config.arm_hold_velocity_min,
+            min(
+                self.config.arm_hold_velocity_max,
+                current_velocity + steps * self.config.arm_hold_velocity_step,
+            ),
+        )
+        current_extra = dict(
+            getattr(
+                self,
+                "_runtime_arm_kp_asr_extra",
+                {motor_name: 0.0 for motor_name in EXTRA_STIFFNESS_MOTORS},
+            )
+        )
+        updated_extra = current_extra
+        gain_delta = steps * self.config.arm_hold_kp_asr_step
+        for motor_name in EXTRA_STIFFNESS_MOTORS:
+            updated_extra[motor_name] = max(
+                0.0,
+                min(
+                    self.config.arm_hold_kp_asr_extra_max[motor_name],
+                    updated_extra[motor_name] + gain_delta,
+                ),
+            )
+
+        verified_gains = dict(
+            getattr(self, "_runtime_arm_hold_kp_asr", self.config.pos_vel_kp_asr)
+        )
+        arm_motor_names = [
+            name for name in self.motor_names if name != FOLLOWER_GRIPPER_MOTOR
+        ]
+        for motor_name in arm_motor_names:
+            requested_kp_asr = self._configured_kp_asr(motor_name)
+            requested_kp_asr += updated_extra.get(motor_name, 0.0)
+            if getattr(self, "_arm_kp_asr_mode", "hold") == "motion":
+                verified_gains[motor_name] = requested_kp_asr
+                continue
+            motor = self.motors[motor_name]
+            motor.write_register_f32(DAMIAO_KP_ASR_REGISTER, requested_kp_asr)
+            try:
+                verified_gains[motor_name] = motor.get_register_f32(
+                    DAMIAO_KP_ASR_REGISTER,
+                    500,
+                )
+            except Exception:
+                verified_gains[motor_name] = requested_kp_asr
+                logger.warning(
+                    "%s KP_ASR readback failed; using requested runtime value %g.",
+                    motor_name,
+                    requested_kp_asr,
+                )
+
+        self._runtime_arm_hold_velocity_deg_s = updated_velocity
+        self._runtime_arm_kp_asr_extra = updated_extra
+        self._runtime_arm_hold_kp_asr = verified_gains
+
+        logger.info(
+            "Arm hold response: vlim=%g deg/s, KP_ASR=%s (RAM only)",
+            updated_velocity,
+            ", ".join(
+                f"{name}={verified_gains[name]:g}" for name in arm_motor_names
+            ),
+        )
+        return updated_velocity, verified_gains
+
+    def set_arm_motion_active(self, active: bool) -> None:
+        """Select motion or hold KP_ASR gains, writing only on mode changes."""
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        if self.motor_type != "dm":
+            return
+
+        requested_mode = "motion" if active else "hold"
+        if getattr(self, "_arm_kp_asr_mode", "hold") == requested_mode:
+            return
+
+        gains = (
+            self.config.arm_motion_kp_asr
+            if active
+            else self._runtime_arm_hold_kp_asr
+        )
+        arm_motor_names = [
+            name for name in self.motor_names if name != FOLLOWER_GRIPPER_MOTOR
+        ]
+        for motor_name in arm_motor_names:
+            self.motors[motor_name].write_register_f32(
+                DAMIAO_KP_ASR_REGISTER,
+                gains[motor_name],
+            )
+
+        self._arm_kp_asr_mode = requested_mode
+        logger.info(
+            "Arm KP_ASR mode: %s (%s)",
+            requested_mode,
+            ", ".join(f"{name}={gains[name]:g}" for name in arm_motor_names),
+        )
 
     def _read_motor_temperatures(self) -> dict[str, float]:
         """Read per-motor MOS temperatures once and return available values."""
@@ -603,6 +786,15 @@ class SeeedB601FollowerBase(Robot):
                         )
                         requested_velocity = max(requested_velocity, tracking_velocity)
                 min_velocity = min(vel_deg_s, self.config.pos_vel_min_velocity)
+                if command_delta_deg <= 1e-9:
+                    min_velocity = min(
+                        vel_deg_s,
+                        getattr(
+                            self,
+                            "_runtime_arm_hold_velocity_deg_s",
+                            self.config.arm_hold_velocity_min,
+                        ),
+                    )
                 vel_deg_s = min(
                     vel_deg_s,
                     max(

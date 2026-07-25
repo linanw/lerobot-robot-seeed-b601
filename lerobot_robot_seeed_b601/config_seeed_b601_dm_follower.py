@@ -55,6 +55,10 @@ class SeeedB601DMFollowerConfig(RobotConfig, SeeedB601FollowerConfigBase):
     # which keeps loaded shoulder/elbow joints synchronized with the wrist.
     adaptive_pos_vel_feedback: bool = True
     pos_vel_tracking_ratio: float = 1.05
+    # Cartesian keyboard jogging has its own acceleration ramp. It does not
+    # affect Ctrl/Shift arm following or Tab gripper following.
+    limit_cartesian_jog_acceleration: bool = True
+    cartesian_jog_accel_m_s2: float = 0.12
     # Keep this below the slowest expected joint rate. A larger floor makes
     # low-scale Cartesian motion asynchronous because small-delta joints arrive
     # much earlier than the rest of the arm.
@@ -101,6 +105,44 @@ class SeeedB601DMFollowerConfig(RobotConfig, SeeedB601FollowerConfigBase):
             "wrist_flex": 1.0,
             "wrist_yaw": 1.0,
             "wrist_roll": 1.0,
+        }
+    )
+    # Runtime arm hold vlim used by keyboard-gated Home/End. A stationary
+    # target otherwise uses pos_vel_min_velocity (0.02 deg/s), which masks
+    # large KP_APR changes by limiting the motor's corrective response.
+    arm_hold_velocity_step: float = 0.5
+    arm_hold_velocity_min: float = 0.02
+    arm_hold_velocity_max: float = 5.0
+    # Home/End adjusts joints 2, 3, and 4 upward from these startup values.
+    # The startup values are also the runtime lower limits.
+    arm_hold_kp_asr_initial: dict[str, float] = field(
+        default_factory=lambda: {
+            "shoulder_pan": 0.0125,
+            "shoulder_lift": 0.0125,
+            "elbow_flex": 0.0125,
+            "wrist_flex": 0.0008,
+            "wrist_yaw": 0.0008,
+            "wrist_roll": 0.0008,
+        }
+    )
+    # Lower speed-loop gains used while Ctrl/Shift/XYZ is actively moving the
+    # arm. Tab controls only the gripper and does not select these gains.
+    arm_motion_kp_asr: dict[str, float] = field(
+        default_factory=lambda: {
+            "shoulder_pan": 0.0125,
+            "shoulder_lift": 0.0125,
+            "elbow_flex": 0.0125,
+            "wrist_flex": 0.0008,
+            "wrist_yaw": 0.0008,
+            "wrist_roll": 0.0008,
+        }
+    )
+    arm_hold_kp_asr_step: float = 0.0004
+    arm_hold_kp_asr_extra_max: dict[str, float] = field(
+        default_factory=lambda: {
+            "shoulder_lift": 0.004,
+            "elbow_flex": 0.004,
+            "wrist_flex": 0.004,
         }
     )
 
